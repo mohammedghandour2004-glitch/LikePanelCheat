@@ -1,0 +1,12 @@
+build/
+cmake-build-*/
+_deps/
+CMakeFiles/
+CMakeCache.txt
+imgui.ini
+*.exe
+*.dll
+*.obj
+*.o
+*.a
+*.lib
