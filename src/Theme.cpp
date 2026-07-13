@@ -32,6 +32,26 @@ bool LoadFontIfExists(ImGuiIO& io, const char* path, float size)
     config.PixelSnapH = true;
     return io.Fonts->AddFontFromFileTTF(path, size, &config) != nullptr;
 }
+
+float Clamp01(float value)
+{
+    if (value < 0.0f)
+    {
+        return 0.0f;
+    }
+    if (value > 1.0f)
+    {
+        return 1.0f;
+    }
+    return value;
+}
+
+float Approach(float current, float target, float responseSeconds)
+{
+    const float dt = ImGui::GetIO().DeltaTime;
+    const float step = responseSeconds > 0.0f ? Clamp01(dt / responseSeconds) : 1.0f;
+    return current + (target - current) * step;
+}
 }
 
 ImVec4 g_AccentColor = ImVec4(0.486f, 0.227f, 0.929f, 1.0f); // #7C3AED
@@ -246,12 +266,9 @@ bool ToggleSwitch(const char* label, bool* value)
         ImGui::MarkItemEdited(id);
     }
 
-    float t = *value ? 1.0f : 0.0f;
-    if (g.LastActiveId == id)
-    {
-        const float animation = ImSaturate(g.LastActiveIdTimer / 0.12f);
-        t = *value ? animation : 1.0f - animation;
-    }
+    float* knobT = window->StateStorage.GetFloatRef(id + 1, *value ? 1.0f : 0.0f);
+    *knobT = Approach(*knobT, *value ? 1.0f : 0.0f, 0.12f);
+    const float t = *knobT;
 
     const ImU32 trackColor = ImGui::GetColorU32(*value
         ? (hovered ? GetAccentHoverColor() : g_AccentColor)
@@ -259,6 +276,23 @@ bool ToggleSwitch(const char* label, bool* value)
     const ImU32 knobColor = ImGui::GetColorU32(ImVec4(0.940f, 0.940f, 0.970f, 1.0f));
 
     window->DrawList->AddRectFilled(switchRect.Min, switchRect.Max, trackColor, radius);
+    if (*value)
+    {
+        window->DrawList->AddRect(
+            ImVec2(switchRect.Min.x + 1.0f, switchRect.Min.y + 1.0f),
+            ImVec2(switchRect.Max.x - 1.0f, switchRect.Max.y - 1.0f),
+            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.20f)),
+            radius,
+            0,
+            1.0f);
+        window->DrawList->AddRect(
+            ImVec2(switchRect.Min.x + 3.0f, switchRect.Min.y + 3.0f),
+            ImVec2(switchRect.Max.x - 3.0f, switchRect.Max.y - 3.0f),
+            ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.30f)),
+            radius - 2.0f,
+            0,
+            1.0f);
+    }
 
     const float knobRadius = radius - 3.0f;
     const float knobX = ImLerp(switchRect.Min.x + radius, switchRect.Max.x - radius, t);

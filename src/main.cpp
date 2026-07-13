@@ -2,6 +2,8 @@
 #include <windows.h>
 #include <d3d11.h>
 
+#include <cstdio>
+
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
@@ -19,10 +21,132 @@ static POINT g_DragStartCursor = {};
 static POINT g_DragStartWindow = {};
 static UINT g_ResizeWidth = 0;
 static UINT g_ResizeHeight = 0;
+static bool g_UseRegisteredHotkey = false;
+static bool g_PreviousToggleKeyDown = false;
 static constexpr int kWindowWidth = 760;
 static constexpr int kWindowHeight = 520;
+static constexpr int kToggleHotkeyId = 0xE22F;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+
+static void EndWindowDrag(HWND hwnd);
+
+enum class PanelVisibilityState
+{
+    Visible,
+    Hiding,
+    HiddenMessage,
+    Hidden,
+    Showing
+};
+
+static float Clamp01(float value)
+{
+    if (value < 0.0f)
+    {
+        return 0.0f;
+    }
+    if (value > 1.0f)
+    {
+        return 1.0f;
+    }
+    return value;
+}
+
+static float EaseOutCubic(float value)
+{
+    const float t = 1.0f - Clamp01(value);
+    return 1.0f - t * t * t;
+}
+
+static float EaseInCubic(float value)
+{
+    const float t = Clamp01(value);
+    return t * t * t;
+}
+
+static void RequestPanelToggle(HWND hwnd, PanelVisibilityState& visibilityState, double& transitionStart)
+{
+    const double now = ImGui::GetTime();
+    if (visibilityState == PanelVisibilityState::Visible || visibilityState == PanelVisibilityState::Showing)
+    {
+        EndWindowDrag(hwnd);
+        visibilityState = PanelVisibilityState::Hiding;
+        transitionStart = now;
+    }
+    else
+    {
+        visibilityState = PanelVisibilityState::Showing;
+        transitionStart = now;
+        ShowWindow(hwnd, SW_SHOW);
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+static void UpdateHotkeyRegistration(HWND hwnd, int& registeredHotkey)
+{
+    if (registeredHotkey == g_ToggleHotkey)
+    {
+        return;
+    }
+
+    if (g_UseRegisteredHotkey)
+    {
+        UnregisterHotKey(hwnd, kToggleHotkeyId);
+        g_UseRegisteredHotkey = false;
+    }
+
+    registeredHotkey = g_ToggleHotkey;
+    g_PreviousToggleKeyDown = false;
+    if (!g_IsCapturingToggleHotkey)
+    {
+        g_UseRegisteredHotkey = RegisterHotKey(hwnd, kToggleHotkeyId, MOD_NOREPEAT, static_cast<UINT>(registeredHotkey)) != FALSE;
+    }
+}
+
+static void RenderPanelHiddenMessage()
+{
+    const ImVec2 windowSize(static_cast<float>(kWindowWidth), static_cast<float>(kWindowHeight));
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(windowSize, ImGuiCond_Always);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+    ImGui::Begin(
+        "EazyE HEX Hidden Hint",
+        nullptr,
+        ImGuiWindowFlags_NoTitleBar |
+            ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove |
+            ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoScrollWithMouse |
+            ImGuiWindowFlags_NoInputs);
+
+    char message[96] = {};
+    std::snprintf(message, sizeof(message), "Panel Hidden - Press %s to restore", GetToggleHotkeyName());
+    const ImVec2 textSize = ImGui::CalcTextSize(message);
+    const ImVec2 cardSize(textSize.x + 42.0f, textSize.y + 26.0f);
+    const ImVec2 cardMin((windowSize.x - cardSize.x) * 0.5f, (windowSize.y - cardSize.y) * 0.5f);
+    const ImVec2 cardMax(cardMin.x + cardSize.x, cardMin.y + cardSize.y);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+    for (int i = 0; i < 3; ++i)
+    {
+        const float spread = 3.0f + static_cast<float>(i) * 3.0f;
+        drawList->AddRectFilled(
+            ImVec2(cardMin.x + 4.0f - spread, cardMin.y + 5.0f - spread),
+            ImVec2(cardMax.x + 4.0f + spread, cardMax.y + 5.0f + spread),
+            ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.18f - static_cast<float>(i) * 0.045f)),
+            9.0f + spread);
+    }
+    drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(ImVec4(0.060f, 0.060f, 0.072f, 0.94f)), 8.0f);
+    drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.45f)), 8.0f, 0, 1.0f);
+    drawList->AddText(ImVec2(cardMin.x + 21.0f, cardMin.y + 13.0f), ImGui::GetColorU32(ImVec4(0.880f, 0.875f, 0.920f, 1.0f)), message);
+
+    ImGui::End();
+    ImGui::PopStyleVar(2);
+    ImGui::PopStyleColor();
+}
 
 static void CleanupRenderTarget()
 {
@@ -311,13 +435,27 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    int registeredHotkey = 0;
+    UpdateHotkeyRegistration(hwnd, registeredHotkey);
 
     bool done = false;
+    PanelVisibilityState visibilityState = PanelVisibilityState::Visible;
+    double visibilityTransitionStart = ImGui::GetTime();
     while (!done)
     {
+        UpdateHotkeyRegistration(hwnd, registeredHotkey);
+
         MSG msg;
         while (PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE))
         {
+            if (msg.message == WM_HOTKEY && msg.wParam == kToggleHotkeyId)
+            {
+                if (!g_IsCapturingToggleHotkey)
+                {
+                    RequestPanelToggle(hwnd, visibilityState, visibilityTransitionStart);
+                }
+                continue;
+            }
             TranslateMessage(&msg);
             DispatchMessage(&msg);
             if (msg.message == WM_QUIT)
@@ -329,6 +467,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         if (done)
         {
             break;
+        }
+
+        if (!g_UseRegisteredHotkey && !g_IsCapturingToggleHotkey)
+        {
+            const bool toggleKeyDown = (GetAsyncKeyState(g_ToggleHotkey) & 0x8000) != 0;
+            if (toggleKeyDown && !g_PreviousToggleKeyDown)
+            {
+                RequestPanelToggle(hwnd, visibilityState, visibilityTransitionStart);
+            }
+            g_PreviousToggleKeyDown = toggleKeyDown;
+        }
+        else if (g_IsCapturingToggleHotkey)
+        {
+            g_PreviousToggleKeyDown = false;
         }
 
         UpdateWindowDrag(hwnd);
@@ -355,19 +507,88 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(static_cast<float>(kWindowWidth), static_cast<float>(kWindowHeight)), ImGuiCond_Always);
-        const ImGuiWindowFlags panelFlags =
-            ImGuiWindowFlags_NoTitleBar |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoCollapse |
-            ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse;
-        ImGui::Begin("EazyE HEX", nullptr, panelFlags);
-        UpdatePanelDragArea(hwnd);
-        RenderMainPanelTabs();
-        ImGui::End();
+        static const double panelOpenStart = ImGui::GetTime();
+        const double now = ImGui::GetTime();
+        float visibilityAlpha = 1.0f;
+        float visibilityScale = 1.0f;
+        bool renderPanel = true;
+        bool renderHiddenMessage = false;
+
+        if (visibilityState == PanelVisibilityState::Hiding)
+        {
+            const float hideT = Clamp01(static_cast<float>((now - visibilityTransitionStart) / 0.15));
+            const float eased = EaseInCubic(hideT);
+            visibilityAlpha = 1.0f - eased;
+            visibilityScale = 1.0f - (0.04f * eased);
+            if (hideT >= 1.0f)
+            {
+                visibilityState = PanelVisibilityState::HiddenMessage;
+                visibilityTransitionStart = now;
+                renderPanel = false;
+                renderHiddenMessage = true;
+            }
+        }
+        else if (visibilityState == PanelVisibilityState::HiddenMessage)
+        {
+            renderPanel = false;
+            renderHiddenMessage = true;
+            if (now - visibilityTransitionStart >= 1.5)
+            {
+                visibilityState = PanelVisibilityState::Hidden;
+                ShowWindow(hwnd, SW_HIDE);
+                g_PanelDragAreaScreen = {};
+                renderHiddenMessage = false;
+            }
+        }
+        else if (visibilityState == PanelVisibilityState::Hidden)
+        {
+            renderPanel = false;
+        }
+        else if (visibilityState == PanelVisibilityState::Showing)
+        {
+            const float showT = EaseOutCubic(static_cast<float>((now - visibilityTransitionStart) / 0.15));
+            visibilityAlpha = showT;
+            visibilityScale = 0.94f + (0.06f * showT);
+            if (showT >= 1.0f)
+            {
+                visibilityState = PanelVisibilityState::Visible;
+                visibilityAlpha = 1.0f;
+                visibilityScale = 1.0f;
+            }
+        }
+
+        const float openT = EaseOutCubic(static_cast<float>((now - panelOpenStart) / 0.25));
+        if (renderPanel)
+        {
+            const float panelScale = (0.90f + (0.10f * openT)) * visibilityScale;
+            const ImVec2 panelSize(static_cast<float>(kWindowWidth) * panelScale, static_cast<float>(kWindowHeight) * panelScale);
+            ImGui::SetNextWindowPos(
+                ImVec2((static_cast<float>(kWindowWidth) - panelSize.x) * 0.5f, (static_cast<float>(kWindowHeight) - panelSize.y) * 0.5f),
+                ImGuiCond_Always);
+            ImGui::SetNextWindowSize(panelSize, ImGuiCond_Always);
+            const ImGuiWindowFlags panelFlags =
+                ImGuiWindowFlags_NoTitleBar |
+                ImGuiWindowFlags_NoMove |
+                ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoCollapse |
+                ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoScrollWithMouse;
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * openT * visibilityAlpha);
+            ImGui::Begin("EazyE HEX", nullptr, panelFlags);
+            UpdatePanelDragArea(hwnd);
+            RenderMainPanelTabs();
+            ImGui::End();
+            ImGui::PopStyleVar();
+        }
+        else
+        {
+            g_PanelDragAreaScreen = {};
+        }
+
+        if (renderHiddenMessage)
+        {
+            RenderPanelHiddenMessage();
+        }
 
         ImGui::Render();
 
@@ -384,6 +605,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 
+    if (g_UseRegisteredHotkey)
+    {
+        UnregisterHotKey(hwnd, kToggleHotkeyId);
+    }
     CleanupDeviceD3D();
     DestroyWindow(hwnd);
     UnregisterClassA(wc.lpszClassName, wc.hInstance);
