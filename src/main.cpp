@@ -2,6 +2,7 @@
 #include <windows.h>
 #include <d3d11.h>
 
+#include <cmath>
 #include <cstdio>
 
 #include "imgui.h"
@@ -14,6 +15,12 @@ static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
 static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
+static ID3D11Texture2D* g_layeredStagingTexture = nullptr;
+static HDC g_layeredMemoryDc = nullptr;
+static HBITMAP g_layeredBitmap = nullptr;
+static void* g_layeredBitmapBits = nullptr;
+static int g_layeredBitmapWidth = 0;
+static int g_layeredBitmapHeight = 0;
 static bool g_SwapChainOccluded = false;
 static bool g_IsDraggingWindow = false;
 static RECT g_PanelDragAreaScreen = {};
@@ -23,9 +30,14 @@ static UINT g_ResizeWidth = 0;
 static UINT g_ResizeHeight = 0;
 static bool g_UseRegisteredHotkey = false;
 static bool g_PreviousToggleKeyDown = false;
+static constexpr int kAuthWindowWidth = 360;
+static constexpr int kAuthWindowHeight = 440;
 static constexpr int kWindowWidth = 760;
 static constexpr int kWindowHeight = 520;
+static constexpr int kWindowCornerRadius = 16;
 static constexpr int kToggleHotkeyId = 0xE22F;
+static constexpr double kSplashDuration = 2.0;
+static constexpr double kSplashFadeDuration = 0.30;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -139,8 +151,8 @@ static void RenderPanelHiddenMessage()
             ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.18f - static_cast<float>(i) * 0.045f)),
             9.0f + spread);
     }
-    drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(ImVec4(0.060f, 0.060f, 0.072f, 0.94f)), 8.0f);
-    drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.45f)), 8.0f, 0, 1.0f);
+    drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(ImVec4(0.060f, 0.060f, 0.072f, 0.94f)), 12.0f);
+    drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.45f)), 12.0f, 0, 1.0f);
     drawList->AddText(ImVec2(cardMin.x + 21.0f, cardMin.y + 13.0f), ImGui::GetColorU32(ImVec4(0.880f, 0.875f, 0.920f, 1.0f)), message);
 
     ImGui::End();
@@ -157,6 +169,28 @@ static void CleanupRenderTarget()
     }
 }
 
+static void CleanupLayeredFrameResources()
+{
+    if (g_layeredStagingTexture != nullptr)
+    {
+        g_layeredStagingTexture->Release();
+        g_layeredStagingTexture = nullptr;
+    }
+    if (g_layeredBitmap != nullptr)
+    {
+        DeleteObject(g_layeredBitmap);
+        g_layeredBitmap = nullptr;
+    }
+    if (g_layeredMemoryDc != nullptr)
+    {
+        DeleteDC(g_layeredMemoryDc);
+        g_layeredMemoryDc = nullptr;
+    }
+    g_layeredBitmapBits = nullptr;
+    g_layeredBitmapWidth = 0;
+    g_layeredBitmapHeight = 0;
+}
+
 static bool CreateRenderTarget()
 {
     ID3D11Texture2D* backBuffer = nullptr;
@@ -170,8 +204,194 @@ static bool CreateRenderTarget()
     return SUCCEEDED(hr);
 }
 
+static float RoundedCornerCoverage(int x, int y, int width, int height)
+{
+    const float radius = static_cast<float>(kWindowCornerRadius);
+    const float px = static_cast<float>(x) + 0.5f;
+    const float py = static_cast<float>(y) + 0.5f;
+    float cx = px;
+    float cy = py;
+
+    if (px < radius)
+    {
+        cx = radius;
+    }
+    else if (px > static_cast<float>(width) - radius)
+    {
+        cx = static_cast<float>(width) - radius;
+    }
+
+    if (py < radius)
+    {
+        cy = radius;
+    }
+    else if (py > static_cast<float>(height) - radius)
+    {
+        cy = static_cast<float>(height) - radius;
+    }
+
+    if (cx == px && cy == py)
+    {
+        return 1.0f;
+    }
+
+    const float dx = px - cx;
+    const float dy = py - cy;
+    const float distance = std::sqrt(dx * dx + dy * dy);
+    if (distance <= radius - 0.5f)
+    {
+        return 1.0f;
+    }
+    if (distance >= radius + 0.5f)
+    {
+        return 0.0f;
+    }
+    return radius + 0.5f - distance;
+}
+
+static bool EnsureLayeredFrameResources(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+    {
+        return false;
+    }
+
+    if (g_layeredStagingTexture != nullptr &&
+        g_layeredBitmap != nullptr &&
+        g_layeredMemoryDc != nullptr &&
+        g_layeredBitmapBits != nullptr &&
+        g_layeredBitmapWidth == width &&
+        g_layeredBitmapHeight == height)
+    {
+        return true;
+    }
+
+    CleanupLayeredFrameResources();
+
+    D3D11_TEXTURE2D_DESC stagingDesc = {};
+    stagingDesc.Width = static_cast<UINT>(width);
+    stagingDesc.Height = static_cast<UINT>(height);
+    stagingDesc.MipLevels = 1;
+    stagingDesc.ArraySize = 1;
+    stagingDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    stagingDesc.SampleDesc.Count = 1;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (g_pd3dDevice == nullptr || FAILED(g_pd3dDevice->CreateTexture2D(&stagingDesc, nullptr, &g_layeredStagingTexture)))
+    {
+        CleanupLayeredFrameResources();
+        return false;
+    }
+
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc == nullptr)
+    {
+        CleanupLayeredFrameResources();
+        return false;
+    }
+    g_layeredMemoryDc = CreateCompatibleDC(screenDc);
+    ReleaseDC(nullptr, screenDc);
+    if (g_layeredMemoryDc == nullptr)
+    {
+        CleanupLayeredFrameResources();
+        return false;
+    }
+
+    BITMAPINFO bitmapInfo = {};
+    bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bitmapInfo.bmiHeader.biWidth = width;
+    bitmapInfo.bmiHeader.biHeight = -height;
+    bitmapInfo.bmiHeader.biPlanes = 1;
+    bitmapInfo.bmiHeader.biBitCount = 32;
+    bitmapInfo.bmiHeader.biCompression = BI_RGB;
+    g_layeredBitmap = CreateDIBSection(g_layeredMemoryDc, &bitmapInfo, DIB_RGB_COLORS, &g_layeredBitmapBits, nullptr, 0);
+    if (g_layeredBitmap == nullptr || g_layeredBitmapBits == nullptr)
+    {
+        CleanupLayeredFrameResources();
+        return false;
+    }
+
+    SelectObject(g_layeredMemoryDc, g_layeredBitmap);
+    g_layeredBitmapWidth = width;
+    g_layeredBitmapHeight = height;
+    return true;
+}
+
+static bool UpdateLayeredWindowFromBackBuffer(HWND hwnd)
+{
+    if (g_pSwapChain == nullptr || g_pd3dDeviceContext == nullptr)
+    {
+        return false;
+    }
+
+    RECT windowRect = {};
+    if (!GetWindowRect(hwnd, &windowRect))
+    {
+        return false;
+    }
+    const int width = windowRect.right - windowRect.left;
+    const int height = windowRect.bottom - windowRect.top;
+    if (!EnsureLayeredFrameResources(width, height))
+    {
+        return false;
+    }
+
+    ID3D11Texture2D* backBuffer = nullptr;
+    if (FAILED(g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&backBuffer))))
+    {
+        return false;
+    }
+
+    g_pd3dDeviceContext->CopyResource(g_layeredStagingTexture, backBuffer);
+    backBuffer->Release();
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(g_pd3dDeviceContext->Map(g_layeredStagingTexture, 0, D3D11_MAP_READ, 0, &mapped)))
+    {
+        return false;
+    }
+
+    unsigned char* destination = static_cast<unsigned char*>(g_layeredBitmapBits);
+    const unsigned char* source = static_cast<const unsigned char*>(mapped.pData);
+    constexpr int kBytesPerPixel = 4;
+    for (int y = 0; y < height; ++y)
+    {
+        const unsigned char* sourceRow = source + static_cast<size_t>(mapped.RowPitch) * static_cast<size_t>(y);
+        unsigned char* destinationRow = destination + static_cast<size_t>(width) * kBytesPerPixel * static_cast<size_t>(y);
+        for (int x = 0; x < width; ++x)
+        {
+            const unsigned char* src = sourceRow + x * kBytesPerPixel;
+            unsigned char* dst = destinationRow + x * kBytesPerPixel;
+            const float coverage = RoundedCornerCoverage(x, y, width, height);
+            dst[0] = static_cast<unsigned char>(static_cast<float>(src[0]) * coverage + 0.5f);
+            dst[1] = static_cast<unsigned char>(static_cast<float>(src[1]) * coverage + 0.5f);
+            dst[2] = static_cast<unsigned char>(static_cast<float>(src[2]) * coverage + 0.5f);
+            dst[3] = static_cast<unsigned char>(static_cast<float>(src[3]) * coverage + 0.5f);
+        }
+    }
+    g_pd3dDeviceContext->Unmap(g_layeredStagingTexture, 0);
+
+    HDC screenDc = GetDC(nullptr);
+    if (screenDc == nullptr)
+    {
+        return false;
+    }
+
+    POINT destinationPoint = { windowRect.left, windowRect.top };
+    SIZE destinationSize = { width, height };
+    POINT sourcePoint = { 0, 0 };
+    BLENDFUNCTION blend = {};
+    blend.BlendOp = AC_SRC_OVER;
+    blend.SourceConstantAlpha = 255;
+    blend.AlphaFormat = AC_SRC_ALPHA;
+    const BOOL updated = UpdateLayeredWindow(hwnd, screenDc, &destinationPoint, &destinationSize, g_layeredMemoryDc, &sourcePoint, 0, &blend, ULW_ALPHA);
+    ReleaseDC(nullptr, screenDc);
+    return updated != FALSE;
+}
+
 static void CleanupDeviceD3D()
 {
+    CleanupLayeredFrameResources();
     CleanupRenderTarget();
     if (g_pSwapChain != nullptr)
     {
@@ -196,7 +416,7 @@ static bool CreateDeviceD3D(HWND hwnd)
     sd.BufferCount = 2;
     sd.BufferDesc.Width = 0;
     sd.BufferDesc.Height = 0;
-    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     sd.BufferDesc.RefreshRate.Numerator = 60;
     sd.BufferDesc.RefreshRate.Denominator = 1;
     sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
@@ -255,6 +475,25 @@ static bool CreateDeviceD3D(HWND hwnd)
 static bool IsPointInRect(const RECT& rect, POINT point)
 {
     return point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom;
+}
+
+static POINT CalculateCenteredWindowPosition(int windowWidth, int windowHeight)
+{
+    RECT workArea = {};
+    if (!SystemParametersInfoA(SPI_GETWORKAREA, 0, &workArea, 0))
+    {
+        workArea.left = 0;
+        workArea.top = 0;
+        workArea.right = GetSystemMetrics(SM_CXSCREEN);
+        workArea.bottom = GetSystemMetrics(SM_CYSCREEN);
+    }
+
+    const int workAreaWidth = workArea.right - workArea.left;
+    const int workAreaHeight = workArea.bottom - workArea.top;
+    POINT position = {};
+    position.x = workArea.left + (workAreaWidth - windowWidth) / 2;
+    position.y = workArea.top + (workAreaHeight - windowHeight) / 2;
+    return position;
 }
 
 static void EndWindowDrag(HWND hwnd)
@@ -397,21 +636,20 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     wc.lpszClassName = "EazyE HEX Overlay";
     RegisterClassExA(&wc);
 
+    const POINT centeredPosition = CalculateCenteredWindowPosition(kAuthWindowWidth, kAuthWindowHeight);
     HWND hwnd = CreateWindowExA(
         WS_EX_TOPMOST | WS_EX_LAYERED,
         wc.lpszClassName,
         "EazyE HEX",
         WS_POPUP,
-        0,
-        0,
-        kWindowWidth,
-        kWindowHeight,
+        centeredPosition.x,
+        centeredPosition.y,
+        kAuthWindowWidth,
+        kAuthWindowHeight,
         nullptr,
         nullptr,
         wc.hInstance,
         nullptr);
-
-    SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), 0, LWA_COLORKEY);
 
     if (!CreateDeviceD3D(hwnd))
     {
@@ -435,12 +673,15 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    SetPanelD3DDevice(g_pd3dDevice);
     int registeredHotkey = 0;
     UpdateHotkeyRegistration(hwnd, registeredHotkey);
 
     bool done = false;
     PanelVisibilityState visibilityState = PanelVisibilityState::Visible;
     double visibilityTransitionStart = ImGui::GetTime();
+    const double appStartTime = ImGui::GetTime();
+    bool mainWindowSizeApplied = false;
     while (!done)
     {
         UpdateHotkeyRegistration(hwnd, registeredHotkey);
@@ -468,6 +709,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         {
             break;
         }
+        const double frameStartTime = ImGui::GetTime();
 
         if (!g_UseRegisteredHotkey && !g_IsCapturingToggleHotkey)
         {
@@ -494,8 +736,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
         if (g_ResizeWidth != 0 && g_ResizeHeight != 0)
         {
+            const UINT resizeWidth = g_ResizeWidth;
+            const UINT resizeHeight = g_ResizeHeight;
             CleanupRenderTarget();
-            g_pSwapChain->ResizeBuffers(0, g_ResizeWidth, g_ResizeHeight, DXGI_FORMAT_UNKNOWN, 0);
+            g_pSwapChain->ResizeBuffers(0, resizeWidth, resizeHeight, DXGI_FORMAT_UNKNOWN, 0);
             g_ResizeWidth = 0;
             g_ResizeHeight = 0;
             CreateRenderTarget();
@@ -507,11 +751,28 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
 
-        static const double panelOpenStart = ImGui::GetTime();
+        static double panelOpenStart = -1.0;
+        static double welcomeExitStart = -1.0;
+        static bool welcomeAccepted = false;
         const double now = ImGui::GetTime();
+        const double splashElapsed = now - appStartTime;
+        const bool splashOnly = splashElapsed < kSplashDuration;
+        const bool splashFading = splashElapsed >= kSplashDuration && splashElapsed < kSplashDuration + kSplashFadeDuration;
+        const bool splashComplete = splashElapsed >= kSplashDuration + kSplashFadeDuration;
+        const bool welcomeExiting = welcomeExitStart >= 0.0 && now - welcomeExitStart < 0.30;
+        if (!welcomeAccepted && welcomeExitStart >= 0.0 && panelOpenStart < 0.0)
+        {
+            panelOpenStart = welcomeExitStart;
+        }
+        if (!welcomeAccepted && welcomeExitStart >= 0.0 && now - welcomeExitStart >= 0.30)
+        {
+            welcomeAccepted = true;
+        }
+        const bool renderWelcome = splashComplete && !welcomeAccepted;
+
         float visibilityAlpha = 1.0f;
         float visibilityScale = 1.0f;
-        bool renderPanel = true;
+        bool renderPanel = !splashOnly && !splashFading && (welcomeAccepted || welcomeExiting);
         bool renderHiddenMessage = false;
 
         if (visibilityState == PanelVisibilityState::Hiding)
@@ -557,7 +818,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             }
         }
 
-        const float openT = EaseOutCubic(static_cast<float>((now - panelOpenStart) / 0.25));
+        const float openT = panelOpenStart >= 0.0
+            ? EaseOutCubic(static_cast<float>((now - panelOpenStart) / 0.25))
+            : 0.0f;
         if (renderPanel)
         {
             const float panelScale = (0.90f + (0.10f * openT)) * visibilityScale;
@@ -590,6 +853,75 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             RenderPanelHiddenMessage();
         }
 
+        if (renderWelcome)
+        {
+            const float welcomeFadeOut = welcomeExiting
+                ? 1.0f - EaseOutCubic(static_cast<float>((now - welcomeExitStart) / 0.30))
+                : 1.0f;
+            ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(static_cast<float>(mainWindowSizeApplied ? kWindowWidth : kAuthWindowWidth), static_cast<float>(mainWindowSizeApplied ? kWindowHeight : kAuthWindowHeight)), ImGuiCond_Always);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * welcomeFadeOut * visibilityAlpha);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+            ImGui::Begin(
+                "EazyE HEX Welcome",
+                nullptr,
+                ImGuiWindowFlags_NoTitleBar |
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoScrollbar |
+                    ImGuiWindowFlags_NoScrollWithMouse);
+            UpdatePanelDragArea(hwnd);
+            if (!welcomeExiting && RenderWelcomeScreen(welcomeFadeOut))
+            {
+                const POINT mainPosition = CalculateCenteredWindowPosition(kWindowWidth, kWindowHeight);
+                SetWindowPos(
+                    hwnd,
+                    nullptr,
+                    mainPosition.x,
+                    mainPosition.y,
+                    kWindowWidth,
+                    kWindowHeight,
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+                g_ResizeWidth = kWindowWidth;
+                g_ResizeHeight = kWindowHeight;
+                mainWindowSizeApplied = true;
+                welcomeExitStart = now;
+            }
+            ImGui::End();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(3);
+        }
+
+        if (splashOnly || splashFading)
+        {
+            const float splashAlpha = splashFading
+                ? 1.0f - EaseOutCubic(static_cast<float>((splashElapsed - kSplashDuration) / kSplashFadeDuration))
+                : 1.0f;
+            const float progress = static_cast<float>(splashElapsed / kSplashDuration);
+            ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
+            ImGui::SetNextWindowSize(ImVec2(static_cast<float>(kAuthWindowWidth), static_cast<float>(kAuthWindowHeight)), ImGuiCond_Always);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+            ImGui::Begin(
+                "EazyE HEX Boot Splash",
+                nullptr,
+                ImGuiWindowFlags_NoTitleBar |
+                    ImGuiWindowFlags_NoMove |
+                    ImGuiWindowFlags_NoResize |
+                    ImGuiWindowFlags_NoCollapse |
+                    ImGuiWindowFlags_NoScrollbar |
+                    ImGuiWindowFlags_NoScrollWithMouse |
+                    ImGuiWindowFlags_NoInputs);
+            RenderBootSplash(progress, splashAlpha);
+            ImGui::End();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
+        }
+
         ImGui::Render();
 
         const float clearColorWithAlpha[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
@@ -597,8 +929,17 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clearColorWithAlpha);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        const HRESULT hr = g_pSwapChain->Present(1, 0);
-        g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
+        UpdateLayeredWindowFromBackBuffer(hwnd);
+        const double frameElapsed = ImGui::GetTime() - frameStartTime;
+        constexpr double kTargetFrameSeconds = 1.0 / 60.0;
+        if (frameElapsed < kTargetFrameSeconds)
+        {
+            const DWORD sleepMs = static_cast<DWORD>((kTargetFrameSeconds - frameElapsed) * 1000.0);
+            if (sleepMs > 0)
+            {
+                Sleep(sleepMs);
+            }
+        }
     }
 
     ImGui_ImplDX11_Shutdown();

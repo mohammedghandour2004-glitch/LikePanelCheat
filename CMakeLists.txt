@@ -79,11 +79,20 @@ if(MINGW)
 endif()
 
 add_executable(EazyE_HEX WIN32
+    src/ConfigManager.cpp
+    src/ConfigManager.h
+    src/ImageLoader.cpp
+    src/ImageLoader.h
     src/main.cpp
     src/PanelUI.cpp
     src/PanelUI.h
     src/Theme.cpp
     src/Theme.h
+)
+
+target_include_directories(EazyE_HEX PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"
 )
 
 target_link_libraries(EazyE_HEX PRIVATE
@@ -92,6 +101,7 @@ target_link_libraries(EazyE_HEX PRIVATE
     d3dcompiler
     dxgi
     gdi32
+    comdlg32
 )
 
 if(MINGW)

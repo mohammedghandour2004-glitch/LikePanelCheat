@@ -1,17 +1,77 @@
 #include "PanelUI.h"
 
+#include "ConfigManager.h"
+#include "ImageLoader.h"
 #include "Theme.h"
 #include "imgui.h"
 
+#include <commdlg.h>
 #include <windows.h>
 
 #include <cmath>
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include <vector>
 
 int g_ToggleHotkey = VK_F2;
 bool g_IsCapturingToggleHotkey = false;
+UiConfigState g_ConfigState;
+ID3D11Device* g_PanelD3DDevice = nullptr;
+ID3D11ShaderResourceView* g_ProfileAvatarTexture = nullptr;
+int g_ProfileAvatarWidth = 0;
+int g_ProfileAvatarHeight = 0;
+std::string g_ProfilePicturePath;
+
+void SetPanelD3DDevice(ID3D11Device* device)
+{
+    g_PanelD3DDevice = device;
+}
+
+const char* GetProfilePicturePath()
+{
+    return g_ProfilePicturePath.c_str();
+}
+
+void ClearProfilePicture()
+{
+    if (g_ProfileAvatarTexture != nullptr)
+    {
+        g_ProfileAvatarTexture->Release();
+        g_ProfileAvatarTexture = nullptr;
+    }
+    g_ProfileAvatarWidth = 0;
+    g_ProfileAvatarHeight = 0;
+    g_ProfilePicturePath.clear();
+}
+
+bool LoadProfilePictureFromPath(const char* path)
+{
+    if (path == nullptr || path[0] == '\0' || g_PanelD3DDevice == nullptr)
+    {
+        ClearProfilePicture();
+        return false;
+    }
+
+    int loadedWidth = 0;
+    int loadedHeight = 0;
+    ID3D11ShaderResourceView* texture = LoadTextureFromFile(path, g_PanelD3DDevice, &loadedWidth, &loadedHeight);
+    if (texture == nullptr)
+    {
+        ClearProfilePicture();
+        return false;
+    }
+
+    if (g_ProfileAvatarTexture != nullptr)
+    {
+        g_ProfileAvatarTexture->Release();
+    }
+    g_ProfileAvatarTexture = texture;
+    g_ProfileAvatarWidth = loadedWidth;
+    g_ProfileAvatarHeight = loadedHeight;
+    g_ProfilePicturePath = path;
+    return true;
+}
 
 const char* GetToggleHotkeyName()
 {
@@ -55,6 +115,9 @@ constexpr ImVec4 kSectionBg = ImVec4(0.075f, 0.075f, 0.086f, 1.0f);
 constexpr ImVec4 kSectionBorder = ImVec4(0.170f, 0.150f, 0.220f, 1.0f);
 constexpr ImVec4 kMutedText = ImVec4(0.580f, 0.580f, 0.640f, 1.0f);
 constexpr float kRowWidgetWidth = 200.0f;
+constexpr float kOuterWindowRounding = 16.0f;
+constexpr float kSectionRounding = 12.0f;
+constexpr float kButtonRounding = 9.0f;
 
 enum class Category
 {
@@ -102,6 +165,7 @@ constexpr CategoryItem kCategories[] = {
 };
 
 std::vector<Toast> g_Toasts;
+char g_ProfileName[32] = "Default";
 
 struct KeyOption
 {
@@ -361,6 +425,106 @@ void DrawLayeredPanelShadow(ImDrawList* drawList, ImVec2 min, ImVec2 max, float 
         rounding + 5.0f);
 }
 
+void DrawAcrylicGrain(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding)
+{
+    struct GrainDot
+    {
+        float x;
+        float y;
+        float alpha;
+        float radius;
+    };
+
+    static std::vector<GrainDot> grain;
+    constexpr int kGrainCount = 440;
+    if (grain.empty())
+    {
+        grain.reserve(kGrainCount);
+        unsigned int seed = 0x8E4A9B1Du;
+        for (int i = 0; i < kGrainCount; ++i)
+        {
+            seed = seed * 1664525u + 1013904223u;
+            const float x = static_cast<float>((seed >> 8) & 0xFFFFu) / 65535.0f;
+            seed = seed * 1664525u + 1013904223u;
+            const float y = static_cast<float>((seed >> 8) & 0xFFFFu) / 65535.0f;
+            seed = seed * 1664525u + 1013904223u;
+            const float alpha = 0.012f + static_cast<float>((seed >> 12) & 0xFFu) / 255.0f * 0.030f;
+            seed = seed * 1664525u + 1013904223u;
+            const float radius = 0.55f + static_cast<float>((seed >> 13) & 0x7Fu) / 127.0f * 0.45f;
+            grain.push_back({ x, y, alpha, radius });
+        }
+    }
+
+    drawList->PushClipRect(min, max, true);
+    for (const GrainDot& dot : grain)
+    {
+        const ImVec2 pos(min.x + (max.x - min.x) * dot.x, min.y + (max.y - min.y) * dot.y);
+        drawList->AddCircleFilled(pos, dot.radius, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, dot.alpha)), 6);
+    }
+    drawList->PopClipRect();
+}
+
+void DrawAcrylicPanelSurface(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding)
+{
+    const float width = max.x - min.x;
+    const float height = max.y - min.y;
+    if (width <= 8.0f || height <= 8.0f)
+    {
+        return;
+    }
+
+    drawList->AddRectFilled(
+        min,
+        max,
+        ImGui::GetColorU32(ImVec4(0.043f, 0.043f, 0.054f, 1.0f)),
+        rounding);
+    drawList->AddRectFilledMultiColor(
+        ImVec2(min.x + rounding, min.y + 1.0f),
+        ImVec2(max.x - rounding, max.y - 1.0f),
+        ImGui::GetColorU32(ImVec4(0.050f, 0.050f, 0.062f, 0.82f)),
+        ImGui::GetColorU32(ImVec4(0.044f, 0.043f, 0.055f, 0.82f)),
+        ImGui::GetColorU32(ImVec4(0.031f, 0.031f, 0.040f, 0.72f)),
+        ImGui::GetColorU32(ImVec4(0.037f, 0.037f, 0.048f, 0.72f)));
+
+    const float highlightHeight = height * 0.22f;
+    drawList->AddRectFilledMultiColor(
+        ImVec2(min.x + rounding, min.y + 1.0f),
+        ImVec2(max.x - rounding, min.y + highlightHeight),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.115f)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.055f)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)));
+    drawList->AddCircleFilled(
+        ImVec2(min.x + width * 0.28f, min.y + height * 0.18f),
+        width * 0.38f,
+        ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.028f)),
+        96);
+
+    DrawAcrylicGrain(drawList, min, max, rounding);
+
+    drawList->AddRect(
+        ImVec2(min.x + 0.5f, min.y + 0.5f),
+        ImVec2(max.x - 0.5f, max.y - 0.5f),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.165f)),
+        rounding,
+        0,
+        1.0f);
+    drawList->AddRect(
+        ImVec2(min.x + 1.8f, min.y + 1.8f),
+        ImVec2(max.x - 1.8f, max.y - 1.8f),
+        AccentU32(0.105f),
+        rounding - 1.0f,
+        0,
+        1.0f);
+    drawList->AddRect(
+        ImVec2(min.x + 3.0f, min.y + 3.0f),
+        ImVec2(max.x - 3.0f, max.y - 3.0f),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.040f)),
+        rounding - 2.0f,
+        0,
+        1.0f);
+}
+
 ImVec2 DrawLicensedBadge(ImDrawList* drawList, ImVec2 badgeMax)
 {
     const char* label = "LICENSED";
@@ -414,6 +578,10 @@ void DrawPremiumTopStrip(ImDrawList* drawList, ImVec2 min, ImVec2 max)
 
     const float time = static_cast<float>(ImGui::GetTime());
     const float stripHeight = 5.0f;
+    const float edgeInset = kOuterWindowRounding - 1.0f;
+    const float stripMinX = min.x + edgeInset;
+    const float stripMaxX = max.x - edgeInset;
+    const float stripWidth = stripMaxX - stripMinX;
     const ImVec4 accent = g_AccentColor;
     const ImVec4 lightAccent = GetAccentHoverColor();
     const ImVec4 deepAccent = ScaleColor(g_AccentColor, 0.58f, 1.0f);
@@ -421,8 +589,8 @@ void DrawPremiumTopStrip(ImDrawList* drawList, ImVec2 min, ImVec2 max)
 
     for (int i = 0; i < kSegments; ++i)
     {
-        const float x0 = min.x + width * (static_cast<float>(i) / static_cast<float>(kSegments));
-        const float x1 = min.x + width * (static_cast<float>(i + 1) / static_cast<float>(kSegments));
+        const float x0 = stripMinX + stripWidth * (static_cast<float>(i) / static_cast<float>(kSegments));
+        const float x1 = stripMinX + stripWidth * (static_cast<float>(i + 1) / static_cast<float>(kSegments));
         const float phase0 = fmodf(static_cast<float>(i) / static_cast<float>(kSegments) + time * 0.075f, 1.0f);
         const float phase1 = fmodf(static_cast<float>(i + 1) / static_cast<float>(kSegments) + time * 0.075f, 1.0f);
         const auto sample = [&](float phase) {
@@ -454,8 +622,8 @@ void DrawPremiumTopStrip(ImDrawList* drawList, ImVec2 min, ImVec2 max)
         const float alphaTop = 0.18f - static_cast<float>(i) * 0.030f;
         const float alphaBottom = alphaTop * 0.22f;
         drawList->AddRectFilledMultiColor(
-            ImVec2(min.x, y0),
-            ImVec2(max.x, y1),
+            ImVec2(stripMinX, y0),
+            ImVec2(stripMaxX, y1),
             AccentU32(alphaTop),
             ImGui::GetColorU32(WithAlpha(lightAccent, alphaTop * 0.72f)),
             ImGui::GetColorU32(WithAlpha(lightAccent, alphaBottom)),
@@ -740,17 +908,18 @@ bool GradientButton(const char* label, ImVec2 size)
     const ImVec2 max(drawPos.x + drawSize.x, drawPos.y + drawSize.y);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
 
+    drawList->AddRectFilled(drawPos, max, ImGui::GetColorU32(bottom), kButtonRounding);
     drawList->AddRectFilledMultiColor(
-        drawPos,
-        max,
+        ImVec2(drawPos.x + kButtonRounding * 0.55f, drawPos.y),
+        ImVec2(max.x - kButtonRounding * 0.55f, max.y),
         ImGui::GetColorU32(top),
         ImGui::GetColorU32(top),
         ImGui::GetColorU32(bottom),
         ImGui::GetColorU32(bottom));
-    drawList->AddRect(drawPos, max, ImGui::GetColorU32(GetAccentHoverColor()), 6.0f, 0, 1.0f);
+    drawList->AddRect(drawPos, max, ImGui::GetColorU32(GetAccentHoverColor()), kButtonRounding, 0, 1.0f);
     if (hovered || active)
     {
-        drawList->AddRect(ImVec2(drawPos.x - 1.0f, drawPos.y - 1.0f), ImVec2(max.x + 1.0f, max.y + 1.0f), AccentU32(0.24f), 7.0f, 0, 2.0f);
+        drawList->AddRect(ImVec2(drawPos.x - 1.0f, drawPos.y - 1.0f), ImVec2(max.x + 1.0f, max.y + 1.0f), AccentU32(0.24f), kButtonRounding + 1.0f, 0, 2.0f);
     }
 
     const ImVec2 textSize = ImGui::CalcTextSize(label);
@@ -938,11 +1107,11 @@ void SectionBegin(const char* title)
 {
     const ImVec2 sectionShadowMin = ImGui::GetCursorScreenPos();
     const ImVec2 sectionShadowMax(sectionShadowMin.x + ImGui::GetContentRegionAvail().x, sectionShadowMin.y + 96.0f);
-    DrawSectionCardShadow(ImGui::GetWindowDrawList(), sectionShadowMin, sectionShadowMax, 8.0f);
+    DrawSectionCardShadow(ImGui::GetWindowDrawList(), sectionShadowMin, sectionShadowMax, kSectionRounding);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, kSectionBg);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, WithAlpha(kSectionBg, 0.90f));
     ImGui::PushStyleColor(ImGuiCol_Border, kSectionBorder);
-    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 8.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, kSectionRounding);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
     ImGui::BeginChild(title, ImVec2(0.0f, 0.0f), ImGuiChildFlags_Borders | ImGuiChildFlags_AutoResizeY);
     const ImVec2 headerPos = ImGui::GetCursorScreenPos();
@@ -972,7 +1141,12 @@ void SectionBegin(const char* title)
 void SectionEnd()
 {
     ImGui::EndChild();
-    DrawSectionLift(ImGui::GetWindowDrawList(), ImGui::GetItemRectMin(), ImGui::GetItemRectMax(), 8.0f);
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    DrawSectionLift(ImGui::GetWindowDrawList(), min, max, kSectionRounding);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->AddRect(ImVec2(min.x + 0.5f, min.y + 0.5f), ImVec2(max.x - 0.5f, max.y - 0.5f), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.095f)), kSectionRounding, 0, 1.0f);
+    drawList->AddRect(ImVec2(min.x + 2.0f, min.y + 2.0f), ImVec2(max.x - 2.0f, max.y - 2.0f), AccentU32(0.055f), kSectionRounding - 1.0f, 0, 1.0f);
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(2);
     ImGui::Spacing();
@@ -1200,13 +1374,181 @@ void RenderBrandHeader()
     ImGui::EndGroup();
 }
 
+void RenderBootSplashInternal(float progress, float alpha)
+{
+    const ImVec2 windowSize = ImGui::GetContentRegionAvail();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 windowPos = ImGui::GetWindowPos();
+    const ImVec2 windowMax(windowPos.x + windowSize.x, windowPos.y + windowSize.y);
+    const ImVec2 center(windowPos.x + windowSize.x * 0.5f, windowPos.y + windowSize.y * 0.5f);
+    const float clampedProgress = Clamp01(progress);
+    const float pulse = 0.5f + 0.5f * sinf(static_cast<float>(ImGui::GetTime()) * 4.2f);
+    const float logoSize = windowSize.y * 0.18f < 94.0f ? windowSize.y * 0.18f : 94.0f;
+    const float barWidth = windowSize.x * 0.70f < 300.0f ? windowSize.x * 0.70f : 300.0f;
+    const float barHeight = 6.0f;
+    const float logoTop = windowPos.y + windowSize.y * 0.18f;
+    const float titleY = logoTop + logoSize + 24.0f;
+    const float barY = titleY + 64.0f;
+    const float statusY = barY + 26.0f;
+
+    DrawLayeredPanelShadow(drawList, windowPos, windowMax, kOuterWindowRounding);
+    DrawAcrylicPanelSurface(drawList, windowPos, windowMax, kOuterWindowRounding);
+    DrawPremiumTopStrip(drawList, windowPos, windowMax);
+    DrawAnimatedGradientMesh(drawList, windowPos, windowMax, 0.62f * alpha);
+    DrawAnimatedTechPattern(drawList, windowPos, windowMax, 0.50f * alpha);
+    drawList->AddCircleFilled(center, windowSize.x * 0.32f + pulse * 8.0f, AccentU32((0.032f + pulse * 0.030f) * alpha), 96);
+    drawList->AddCircleFilled(ImVec2(center.x - windowSize.x * 0.16f, center.y - windowSize.y * 0.10f), windowSize.x * 0.22f, AccentU32(0.020f * alpha), 96);
+    drawList->AddCircleFilled(ImVec2(center.x + windowSize.x * 0.18f, center.y + windowSize.y * 0.12f), windowSize.x * 0.24f, ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.020f * alpha)), 96);
+
+    const ImVec2 logoPos(center.x - logoSize * 0.5f, logoTop);
+    RenderEzMonogram(drawList, logoPos, logoSize);
+
+    const char* title = "EazyE HEX";
+    if (g_FontSection != nullptr)
+    {
+        const ImVec2 titleSize = g_FontSection->CalcTextSizeA(g_FontSection->LegacySize, FLT_MAX, 0.0f, title);
+        drawList->AddText(g_FontSection, g_FontSection->LegacySize, ImVec2(center.x - titleSize.x * 0.5f, titleY), ImGui::GetColorU32(WithAlpha(g_AccentColor, alpha)), title);
+    }
+    else
+    {
+        const ImVec2 titleSize = ImGui::CalcTextSize(title);
+        drawList->AddText(ImVec2(center.x - titleSize.x * 0.5f, titleY), ImGui::GetColorU32(WithAlpha(g_AccentColor, alpha)), title);
+    }
+
+    const ImVec2 barMin(center.x - barWidth * 0.5f, barY);
+    const ImVec2 barMax(center.x + barWidth * 0.5f, barY + barHeight);
+    drawList->AddRectFilled(barMin, barMax, ImGui::GetColorU32(ImVec4(0.085f, 0.082f, 0.105f, 0.90f * alpha)), 3.0f);
+    const ImVec2 fillMax(barMin.x + (barMax.x - barMin.x) * clampedProgress, barMax.y);
+    drawList->AddRectFilledMultiColor(
+        barMin,
+        fillMax,
+        AccentU32(0.92f * alpha),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.96f * alpha)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.74f * alpha)),
+        AccentU32(0.68f * alpha));
+    drawList->AddRect(barMin, barMax, AccentU32(0.34f * alpha), 3.0f, 0, 1.0f);
+
+    const char* status = "Initializing EazyE HEX...";
+    if (clampedProgress >= 0.75f)
+    {
+        status = "Ready";
+    }
+    else if (clampedProgress >= 0.40f)
+    {
+        status = "Loading interface...";
+    }
+
+    if (g_FontSmall != nullptr)
+    {
+        const ImVec2 statusSize = g_FontSmall->CalcTextSizeA(g_FontSmall->LegacySize, FLT_MAX, 0.0f, status);
+        drawList->AddText(g_FontSmall, g_FontSmall->LegacySize, ImVec2(center.x - statusSize.x * 0.5f, statusY), ImGui::GetColorU32(WithAlpha(kMutedText, alpha)), status);
+    }
+    else
+    {
+        const ImVec2 statusSize = ImGui::CalcTextSize(status);
+        drawList->AddText(ImVec2(center.x - statusSize.x * 0.5f, statusY), ImGui::GetColorU32(WithAlpha(kMutedText, alpha)), status);
+    }
+}
+
+bool OpenAvatarFileDialog(char* path, DWORD pathSize)
+{
+    OPENFILENAMEA ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = GetActiveWindow();
+    ofn.lpstrFile = path;
+    ofn.nMaxFile = pathSize;
+    ofn.lpstrFilter = "Image Files (*.png;*.jpg;*.jpeg)\0*.png;*.jpg;*.jpeg\0PNG Files (*.png)\0*.png\0JPEG Files (*.jpg;*.jpeg)\0*.jpg;*.jpeg\0All Files (*.*)\0*.*\0";
+    ofn.nFilterIndex = 1;
+    ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+    return GetOpenFileNameA(&ofn) != FALSE;
+}
+
+void DrawAvatarPlaceholder(ImDrawList* drawList, ImVec2 center, float radius)
+{
+    drawList->AddCircleFilled(center, radius, ImGui::GetColorU32(ImVec4(0.088f, 0.082f, 0.105f, 1.0f)), 48);
+    drawList->AddCircle(center, radius, AccentU32(0.42f), 48, 1.4f);
+    drawList->AddCircle(center, radius - 2.0f, AccentU32(0.12f), 48, 1.0f);
+
+    const ImU32 icon = ImGui::GetColorU32(ImVec4(0.620f, 0.590f, 0.700f, 1.0f));
+    drawList->AddCircle(ImVec2(center.x, center.y - radius * 0.26f), radius * 0.22f, icon, 28, 1.7f);
+    drawList->AddBezierCubic(
+        ImVec2(center.x - radius * 0.46f, center.y + radius * 0.44f),
+        ImVec2(center.x - radius * 0.34f, center.y + radius * 0.06f),
+        ImVec2(center.x + radius * 0.34f, center.y + radius * 0.06f),
+        ImVec2(center.x + radius * 0.46f, center.y + radius * 0.44f),
+        icon,
+        1.7f);
+}
+
+void RenderProfileAvatar()
+{
+    constexpr float diameter = 46.0f;
+    const ImVec2 avatarSize(diameter, diameter);
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const bool clicked = ImGui::InvisibleButton("##ProfileAvatar", avatarSize);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 center(pos.x + diameter * 0.5f, pos.y + diameter * 0.5f);
+    const float radius = diameter * 0.5f;
+
+    if (g_ProfileAvatarTexture != nullptr)
+    {
+        drawList->AddImageRounded(
+            reinterpret_cast<ImTextureID>(g_ProfileAvatarTexture),
+            pos,
+            ImVec2(pos.x + diameter, pos.y + diameter),
+            ImVec2(0.0f, 0.0f),
+            ImVec2(1.0f, 1.0f),
+            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 1.0f)),
+            radius);
+        drawList->AddCircle(center, radius, AccentU32(hovered ? 0.68f : 0.44f), 48, hovered ? 2.0f : 1.4f);
+    }
+    else
+    {
+        DrawAvatarPlaceholder(drawList, center, radius);
+        if (hovered)
+        {
+            drawList->AddCircle(center, radius + 1.5f, AccentU32(0.46f), 48, 1.6f);
+        }
+    }
+
+    if (clicked)
+    {
+        if (g_PanelD3DDevice == nullptr)
+        {
+            ShowToast("Profile picture unavailable: D3D device missing", ToastType::Warning);
+        }
+        else
+        {
+            char path[MAX_PATH] = {};
+            if (OpenAvatarFileDialog(path, MAX_PATH))
+            {
+                if (LoadProfilePictureFromPath(path))
+                {
+                    ShowToast("Profile picture updated", ToastType::Success);
+                }
+                else
+                {
+                    ShowToast("Failed to load profile picture", ToastType::Warning);
+                }
+            }
+        }
+    }
+
+    if (hovered)
+    {
+        ImGui::SetTooltip("Choose profile picture");
+    }
+    (void)g_ProfileAvatarWidth;
+    (void)g_ProfileAvatarHeight;
+}
+
 void RenderSidebar(Category* selected)
 {
     constexpr float headerHeight = 72.0f;
     constexpr float footerHeight = 82.0f;
-    static char profileName[32] = "Default";
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, kSidebarBg);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, WithAlpha(kSidebarBg, 0.88f));
     DrawSoftShadow(
         ImGui::GetWindowDrawList(),
         ImGui::GetCursorScreenPos(),
@@ -1282,6 +1624,10 @@ void RenderSidebar(Category* selected)
         ImVec2(ImGui::GetWindowPos().x + ImGui::GetWindowSize().x, ImGui::GetWindowPos().y + ImGui::GetWindowSize().y),
         0.70f);
     GradientSeparator();
+    ImGui::Dummy(ImVec2(0.0f, 5.0f));
+    RenderProfileAvatar();
+    ImGui::SameLine();
+    ImGui::BeginGroup();
     if (g_FontSmall != nullptr)
     {
         ImGui::PushFont(g_FontSmall);
@@ -1298,7 +1644,7 @@ void RenderSidebar(Category* selected)
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputText("##ProfileName", profileName, sizeof(profileName));
+    ImGui::InputText("##ProfileName", g_ProfileName, sizeof(g_ProfileName));
     if (ImGui::IsItemActive())
     {
         ImGui::GetWindowDrawList()->AddRect(
@@ -1311,6 +1657,7 @@ void RenderSidebar(Category* selected)
     }
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(4);
+    ImGui::EndGroup();
     ImGui::EndChild();
 
     ImGui::EndChild();
@@ -1400,23 +1747,6 @@ void RenderLiveStatsBar()
     ImGui::Dummy(ImVec2(width, barHeight + 8.0f));
 }
 
-void RenderSearchBar()
-{
-    static char searchText[128] = {};
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##SearchSettings", "Search settings...", searchText, sizeof(searchText));
-    if (ImGui::IsItemActive())
-    {
-        DrawInnerGlow(
-            ImGui::GetWindowDrawList(),
-            ImGui::GetItemRectMin(),
-            ImGui::GetItemRectMax(),
-            8.0f,
-            0.28f);
-    }
-    ImGui::Spacing();
-}
-
 void PopupButton(const char* label, const char* popupId, const char* popupText, const char* toastMessage, ToastType toastType)
 {
     if (GradientButton(label, ImVec2(118.0f, 28.0f)))
@@ -1435,6 +1765,68 @@ void PopupButton(const char* label, const char* popupId, const char* popupText, 
         }
         ImGui::EndPopup();
     }
+}
+
+void SaveConfigButton()
+{
+    if (GradientButton("Save Config", ImVec2(118.0f, 28.0f)))
+    {
+        const ConfigSaveResult result = SaveConfigToFile(g_ProfileName);
+        if (result.success)
+        {
+            const std::string message = "Configuration saved to " + result.path;
+            ShowToast(message.c_str(), ToastType::Success);
+        }
+        else
+        {
+            const std::string message = "Save failed: " + result.error;
+            ShowToast(message.c_str(), ToastType::Warning);
+        }
+    }
+    Tooltip("Writes the current UI state to a JSON config next to the executable.");
+}
+
+void LoadConfigButton()
+{
+    if (GradientButton("Load Config", ImVec2(118.0f, 28.0f)))
+    {
+        const ConfigSaveResult result = LoadConfigFromFile(g_ProfileName);
+        if (result.success)
+        {
+            const std::string message = "Configuration loaded from " + result.path;
+            ShowToast(message.c_str(), ToastType::Info);
+            if (!result.warning.empty())
+            {
+                ShowToast(result.warning.c_str(), ToastType::Warning);
+            }
+        }
+        else
+        {
+            const std::string message = "Load failed: " + result.error;
+            ShowToast(message.c_str(), ToastType::Warning);
+        }
+    }
+    Tooltip("Loads the current profile JSON from the configs folder.");
+}
+
+void DeleteConfigButton()
+{
+    if (GradientButton("Delete Config", ImVec2(118.0f, 28.0f)))
+    {
+        const ConfigSaveResult result = DeleteConfigFile(g_ProfileName);
+        if (result.success)
+        {
+            ShowToast("Configuration file deleted", ToastType::Warning);
+        }
+        else
+        {
+            const char* message = result.error == "Config file does not exist"
+                ? "No configuration file found to delete"
+                : result.error.c_str();
+            ShowToast(message, ToastType::Warning);
+        }
+    }
+    Tooltip("Deletes the current profile JSON from the configs folder.");
 }
 
 void AccentSwatch(const char* label, ImVec4 color)
@@ -1492,65 +1884,327 @@ void RenderHotkeyControls()
 }
 }
 
+void RenderBootSplash(float progress, float alpha)
+{
+    RenderBootSplashInternal(progress, alpha);
+}
+
+std::string FormatElapsedSince(std::int64_t timestamp)
+{
+    if (timestamp <= 0)
+    {
+        return "First launch";
+    }
+
+    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
+    std::int64_t elapsed = now > timestamp ? now - timestamp : 0;
+    if (elapsed < 60)
+    {
+        return "Just now";
+    }
+    if (elapsed < 3600)
+    {
+        const std::int64_t minutes = elapsed / 60;
+        return std::to_string(minutes) + (minutes == 1 ? " minute ago" : " minutes ago");
+    }
+    if (elapsed < 86400)
+    {
+        const std::int64_t hours = elapsed / 3600;
+        return std::to_string(hours) + (hours == 1 ? " hour ago" : " hours ago");
+    }
+
+    const std::int64_t days = elapsed / 86400;
+    return std::to_string(days) + (days == 1 ? " day ago" : " days ago");
+}
+
+void DrawWelcomeInfoRow(ImDrawList* drawList, ImVec2 pos, const char* label, const char* value, bool drawSwatch)
+{
+    const ImU32 labelColor = ImGui::GetColorU32(kMutedText);
+    const ImU32 valueColor = ImGui::GetColorU32(ImVec4(0.900f, 0.895f, 0.940f, 1.0f));
+    drawList->AddText(pos, labelColor, label);
+    if (drawSwatch)
+    {
+        const ImVec2 swatchCenter(pos.x + 126.0f, pos.y + ImGui::GetTextLineHeight() * 0.5f);
+        drawList->AddCircleFilled(swatchCenter, 5.0f, ImGui::GetColorU32(g_AccentColor), 20);
+        drawList->AddCircle(swatchCenter, 6.0f, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.24f)), 20, 1.0f);
+        drawList->AddText(ImVec2(pos.x + 140.0f, pos.y), valueColor, value);
+    }
+    else
+    {
+        drawList->AddText(ImVec2(pos.x + 126.0f, pos.y), valueColor, value);
+    }
+}
+
+bool RenderWelcomeScreen(float alpha)
+{
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const ImVec2 windowPos = ImGui::GetWindowPos();
+    const ImVec2 windowSize = ImGui::GetWindowSize();
+    const ImVec2 authSize(
+        windowSize.x < 360.0f ? windowSize.x : 360.0f,
+        windowSize.y < 440.0f ? windowSize.y : 440.0f);
+    const ImVec2 authPos(
+        windowPos.x + (windowSize.x - authSize.x) * 0.5f,
+        windowPos.y + (windowSize.y - authSize.y) * 0.5f);
+    const ImVec2 authMax(authPos.x + authSize.x, authPos.y + authSize.y);
+
+    DrawLayeredPanelShadow(drawList, authPos, authMax, kOuterWindowRounding);
+    DrawAcrylicPanelSurface(drawList, authPos, authMax, kOuterWindowRounding);
+    DrawPremiumTopStrip(drawList, authPos, authMax);
+    DrawAnimatedGradientMesh(drawList, authPos, authMax, 0.70f);
+    DrawAnimatedTechPattern(drawList, authPos, authMax, 0.55f);
+
+    const float centerX = authPos.x + authSize.x * 0.5f;
+    const float logoSize = 56.0f;
+    RenderEzMonogram(drawList, ImVec2(centerX - logoSize * 0.5f, authPos.y + 44.0f), logoSize);
+
+    const char* title = "Welcome to EazyE HEX";
+    ImFont* titleFont = g_FontSection != nullptr ? g_FontSection : ImGui::GetFont();
+    const float titleSizePx = titleFont->LegacySize;
+    const ImVec2 titleSize = titleFont->CalcTextSizeA(titleSizePx, FLT_MAX, 0.0f, title);
+    drawList->AddText(titleFont, titleSizePx, ImVec2(centerX - titleSize.x * 0.5f, authPos.y + 116.0f), ImGui::GetColorU32(ImVec4(0.940f, 0.930f, 0.980f, 1.0f)), title);
+
+    char profileLine[96] = {};
+    std::snprintf(profileLine, sizeof(profileLine), "Signed in as: %s", g_ProfileName);
+    const ImVec2 profileSize = ImGui::CalcTextSize(profileLine);
+    drawList->AddText(ImVec2(centerX - profileSize.x * 0.5f, authPos.y + 142.0f), ImGui::GetColorU32(kMutedText), profileLine);
+
+    const ImVec2 cardSize(authSize.x - 48.0f, 106.0f);
+    const ImVec2 cardMin(centerX - cardSize.x * 0.5f, authPos.y + 178.0f);
+    const ImVec2 cardMax(cardMin.x + cardSize.x, cardMin.y + cardSize.y);
+    DrawSectionCardShadow(drawList, cardMin, cardMax, kSectionRounding);
+    drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(ImVec4(0.070f, 0.068f, 0.084f, 0.91f)), kSectionRounding);
+    drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.11f)), kSectionRounding, 0, 1.0f);
+    drawList->AddRect(ImVec2(cardMin.x + 2.0f, cardMin.y + 2.0f), ImVec2(cardMax.x - 2.0f, cardMax.y - 2.0f), AccentU32(0.08f), kSectionRounding - 1.0f, 0, 1.0f);
+
+    const std::string lastSession = FormatElapsedSince(GetLastSessionTimestamp(g_ProfileName));
+    const int savedConfigs = CountSavedConfigFiles();
+    char savedConfigText[32] = {};
+    std::snprintf(savedConfigText, sizeof(savedConfigText), "%d", savedConfigs);
+
+    DrawWelcomeInfoRow(drawList, ImVec2(cardMin.x + 20.0f, cardMin.y + 18.0f), "Last session:", lastSession.c_str(), false);
+    DrawWelcomeInfoRow(drawList, ImVec2(cardMin.x + 20.0f, cardMin.y + 45.0f), "Saved configs:", savedConfigText, false);
+    DrawWelcomeInfoRow(drawList, ImVec2(cardMin.x + 20.0f, cardMin.y + 72.0f), "Current theme:", "Accent", true);
+
+    const ImVec2 buttonSize(190.0f, 36.0f);
+    ImGui::SetCursorScreenPos(ImVec2(centerX - buttonSize.x * 0.5f, authPos.y + 324.0f));
+    const bool clicked = GradientButton("Continue to Panel", buttonSize);
+    if (clicked)
+    {
+        const ConfigSaveResult result = UpdateLastSessionTimestamp(g_ProfileName, static_cast<std::int64_t>(std::time(nullptr)));
+        if (!result.success)
+        {
+            ShowToast("Failed to update session timestamp", ToastType::Warning);
+        }
+    }
+
+    (void)alpha;
+    return clicked;
+}
+
+void DrawVisualsLivePreview(const VisualsConfig& state)
+{
+    const ImVec2 previewSize(200.0f, 240.0f);
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float centeredX = ImGui::GetCursorPosX() + (availableWidth - previewSize.x) * 0.5f;
+
+    if (availableWidth > previewSize.x)
+    {
+        ImGui::SetCursorPosX(centeredX);
+    }
+
+    const ImVec2 previewMin = ImGui::GetCursorScreenPos();
+    const ImVec2 previewMax(previewMin.x + previewSize.x, previewMin.y + previewSize.y);
+    ImGui::InvisibleButton("##VisualsLivePreview", previewSize);
+
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList->PushClipRect(previewMin, previewMax, true);
+
+    drawList->AddRectFilledMultiColor(
+        previewMin,
+        previewMax,
+        ImGui::GetColorU32(ImVec4(0.036f, 0.037f, 0.048f, 1.0f)),
+        ImGui::GetColorU32(ImVec4(0.044f, 0.042f, 0.058f, 1.0f)),
+        ImGui::GetColorU32(ImVec4(0.022f, 0.023f, 0.030f, 1.0f)),
+        ImGui::GetColorU32(ImVec4(0.030f, 0.031f, 0.040f, 1.0f)));
+
+    const ImVec2 sceneCenter(previewMin.x + previewSize.x * 0.5f, previewMin.y + previewSize.y * 0.56f);
+    const ImU32 gridColor = ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.08f));
+    const ImU32 groundColor = ImGui::GetColorU32(ImVec4(0.210f, 0.195f, 0.255f, 0.40f));
+    drawList->AddLine(ImVec2(previewMin.x + 22.0f, previewMax.y - 35.0f), ImVec2(previewMax.x - 22.0f, previewMax.y - 35.0f), groundColor, 1.0f);
+    drawList->AddLine(ImVec2(previewMin.x + 34.0f, previewMax.y - 23.0f), ImVec2(previewMax.x - 34.0f, previewMax.y - 23.0f), ImGui::GetColorU32(ImVec4(0.130f, 0.120f, 0.160f, 0.28f)), 1.0f);
+    drawList->AddCircleFilled(ImVec2(previewMin.x + 52.0f, previewMin.y + 44.0f), 40.0f, ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.035f)), 48);
+    drawList->AddCircleFilled(ImVec2(previewMax.x - 44.0f, previewMin.y + 72.0f), 30.0f, ImGui::GetColorU32(WithAlpha(ImVec4(state.glowColor[0], state.glowColor[1], state.glowColor[2], 1.0f), 0.028f)), 48);
+    drawList->AddLine(ImVec2(previewMin.x + 18.0f, previewMin.y + 64.0f), ImVec2(previewMax.x - 18.0f, previewMin.y + 64.0f), gridColor, 1.0f);
+    drawList->AddLine(ImVec2(previewMin.x + 18.0f, previewMin.y + 118.0f), ImVec2(previewMax.x - 18.0f, previewMin.y + 118.0f), gridColor, 1.0f);
+
+    const ImVec4 chams(state.chamsColor[0], state.chamsColor[1], state.chamsColor[2], state.chamsColor[3]);
+    const ImVec4 glow(state.glowColor[0], state.glowColor[1], state.glowColor[2], state.glowColor[3]);
+    const ImU32 bodyColor = ImGui::GetColorU32(WithAlpha(chams, 0.72f * chams.w));
+    const ImU32 bodyShade = ImGui::GetColorU32(WithAlpha(ScaleColor(chams, 0.62f), 0.82f * chams.w));
+    const ImU32 bodyEdge = ImGui::GetColorU32(WithAlpha(ScaleColor(chams, 1.20f), 0.88f * chams.w));
+    const ImU32 glowLine = ImGui::GetColorU32(WithAlpha(glow, 0.78f * glow.w));
+
+    const ImVec2 headCenter(sceneCenter.x, sceneCenter.y - 72.0f);
+    const float headRadius = 18.0f;
+    const ImVec2 torsoMin(sceneCenter.x - 24.0f, sceneCenter.y - 48.0f);
+    const ImVec2 torsoMax(sceneCenter.x + 24.0f, sceneCenter.y + 24.0f);
+    const ImVec2 silhouetteMin(sceneCenter.x - 43.0f, sceneCenter.y - 94.0f);
+    const ImVec2 silhouetteMax(sceneCenter.x + 43.0f, sceneCenter.y + 75.0f);
+
+    for (int layer = 3; layer >= 1; --layer)
+    {
+        const float spread = static_cast<float>(layer) * 5.0f;
+        const float alpha = 0.055f * static_cast<float>(4 - layer) * glow.w;
+        const ImU32 glowSoft = ImGui::GetColorU32(WithAlpha(glow, alpha));
+        drawList->AddRect(ImVec2(silhouetteMin.x - spread, silhouetteMin.y - spread), ImVec2(silhouetteMax.x + spread, silhouetteMax.y + spread), glowSoft, 18.0f, 0, 2.0f);
+        drawList->AddCircle(headCenter, headRadius + spread * 0.55f, glowSoft, 36, 2.0f);
+    }
+
+    drawList->AddCircleFilled(headCenter, headRadius, bodyColor, 40);
+    drawList->AddRectFilled(torsoMin, torsoMax, bodyColor, 11.0f);
+    drawList->AddRectFilled(ImVec2(sceneCenter.x - 41.0f, sceneCenter.y - 38.0f), ImVec2(sceneCenter.x - 25.0f, sceneCenter.y + 20.0f), bodyShade, 8.0f);
+    drawList->AddRectFilled(ImVec2(sceneCenter.x + 25.0f, sceneCenter.y - 38.0f), ImVec2(sceneCenter.x + 41.0f, sceneCenter.y + 20.0f), bodyShade, 8.0f);
+    drawList->AddRectFilled(ImVec2(sceneCenter.x - 22.0f, sceneCenter.y + 20.0f), ImVec2(sceneCenter.x - 5.0f, sceneCenter.y + 74.0f), bodyShade, 7.0f);
+    drawList->AddRectFilled(ImVec2(sceneCenter.x + 5.0f, sceneCenter.y + 20.0f), ImVec2(sceneCenter.x + 22.0f, sceneCenter.y + 74.0f), bodyShade, 7.0f);
+    drawList->AddCircle(headCenter, headRadius, bodyEdge, 40, 1.3f);
+    drawList->AddRect(torsoMin, torsoMax, bodyEdge, 11.0f, 0, 1.2f);
+
+    if (state.skeletonEsp)
+    {
+        const ImU32 skeletonColor = ImGui::GetColorU32(ImVec4(0.945f, 0.935f, 0.980f, 0.92f));
+        const ImVec2 neck(sceneCenter.x, sceneCenter.y - 50.0f);
+        const ImVec2 pelvis(sceneCenter.x, sceneCenter.y + 24.0f);
+        drawList->AddLine(headCenter, neck, skeletonColor, 1.4f);
+        drawList->AddLine(neck, pelvis, skeletonColor, 1.4f);
+        drawList->AddLine(ImVec2(sceneCenter.x - 34.0f, sceneCenter.y - 32.0f), ImVec2(sceneCenter.x + 34.0f, sceneCenter.y - 32.0f), skeletonColor, 1.4f);
+        drawList->AddLine(ImVec2(sceneCenter.x - 34.0f, sceneCenter.y - 32.0f), ImVec2(sceneCenter.x - 36.0f, sceneCenter.y + 18.0f), skeletonColor, 1.4f);
+        drawList->AddLine(ImVec2(sceneCenter.x + 34.0f, sceneCenter.y - 32.0f), ImVec2(sceneCenter.x + 36.0f, sceneCenter.y + 18.0f), skeletonColor, 1.4f);
+        drawList->AddLine(pelvis, ImVec2(sceneCenter.x - 13.0f, sceneCenter.y + 74.0f), skeletonColor, 1.4f);
+        drawList->AddLine(pelvis, ImVec2(sceneCenter.x + 13.0f, sceneCenter.y + 74.0f), skeletonColor, 1.4f);
+        drawList->AddCircleFilled(neck, 2.1f, skeletonColor, 10);
+        drawList->AddCircleFilled(pelvis, 2.1f, skeletonColor, 10);
+    }
+
+    if (state.boxEsp)
+    {
+        drawList->AddRect(silhouetteMin, silhouetteMax, glowLine, 2.0f, 0, 1.4f);
+        drawList->AddRect(ImVec2(silhouetteMin.x - 1.0f, silhouetteMin.y - 1.0f), ImVec2(silhouetteMax.x + 1.0f, silhouetteMax.y + 1.0f), ImGui::GetColorU32(ImVec4(0.000f, 0.000f, 0.000f, 0.30f)), 2.0f, 0, 1.0f);
+    }
+
+    if (state.healthBar)
+    {
+        const ImVec2 barMin(sceneCenter.x - 34.0f, silhouetteMin.y - 13.0f);
+        const ImVec2 barMax(sceneCenter.x + 34.0f, silhouetteMin.y - 8.0f);
+        drawList->AddRectFilled(barMin, barMax, ImGui::GetColorU32(ImVec4(0.055f, 0.055f, 0.064f, 0.95f)), 2.0f);
+        drawList->AddRectFilled(barMin, ImVec2(barMin.x + (barMax.x - barMin.x) * 0.75f, barMax.y), ImGui::GetColorU32(ImVec4(0.180f, 0.820f, 0.360f, 1.0f)), 2.0f);
+    }
+
+    if (state.nameTags)
+    {
+        const char* name = "Player_01";
+        const ImVec2 nameSize = ImGui::CalcTextSize(name);
+        drawList->AddText(ImVec2(sceneCenter.x - nameSize.x * 0.5f, silhouetteMin.y - 31.0f), ImGui::GetColorU32(ImVec4(0.900f, 0.895f, 0.940f, 1.0f)), name);
+    }
+
+    if (state.distanceText)
+    {
+        const char* distance = "42m";
+        drawList->AddText(ImVec2(silhouetteMax.x + 9.0f, sceneCenter.y + 26.0f), ImGui::GetColorU32(kMutedText), distance);
+    }
+
+    drawList->AddRect(previewMin, previewMax, ImGui::GetColorU32(kSectionBorder), 8.0f, 0, 1.0f);
+    drawList->PopClipRect();
+}
+
 void AimTab()
 {
-    static bool enabled = false;
-    static bool drawFovCircle = true;
-    static float fov = 90.0f;
-    static float smoothness = 6.0f;
-    static int targetPriority = 0;
-    static int aimBone = 0;
+    AimbotConfig& state = g_ConfigState.aimbot;
     constexpr const char* priorities[] = { "Closest", "Lowest HP", "Random" };
     constexpr const char* bones[] = { "Head", "Chest", "Auto" };
 
     SectionBegin("General");
-    ToggleRow("Enabled", &enabled, "Would enable the mock aim-assist panel state.");
-    ToggleRow("Draw FOV Circle", &drawFovCircle, "Would show a preview circle for the configured field of view.");
+    ToggleRow("Enabled", &state.enabled, "Would enable the mock aim-assist panel state.");
+    ToggleRow("Draw FOV Circle", &state.drawFovCircle, "Would show a preview circle for the configured field of view.");
     KeybindDisplay("Aim Key", "MOUSE4", "Displays the mock activation key for documentation only.");
     SectionEnd();
 
     SectionBegin("Targeting");
-    SliderFloatRow("FOV", &fov, 10.0f, 180.0f, "%.0f", "Would adjust the preview field-of-view radius.");
-    SliderFloatRow("Smoothness", &smoothness, 1.0f, 20.0f, "%.1f", "Would tune mock movement smoothing in the UI.");
-    ComboRow("Target Priority", &targetPriority, priorities, 3, "Would choose how targets are prioritized in a real implementation.");
-    ComboRow("Aim Bone", &aimBone, bones, 3, "Would choose a preferred mock target bone.");
+    SliderFloatRow("FOV", &state.fov, 10.0f, 180.0f, "%.0f", "Would adjust the preview field-of-view radius.");
+    SliderFloatRow("Smoothness", &state.smoothness, 1.0f, 20.0f, "%.1f", "Would tune mock movement smoothing in the UI.");
+    ComboRow("Target Priority", &state.targetPriority, priorities, 3, "Would choose how targets are prioritized in a real implementation.");
+    ComboRow("Aim Bone", &state.aimBone, bones, 3, "Would choose a preferred mock target bone.");
     SectionEnd();
 }
 
 void VisualsTab()
 {
-    static bool boxEsp = true;
-    static bool skeletonEsp = false;
-    static bool healthBar = true;
-    static bool nameTags = false;
-    static bool distanceText = true;
-    static bool snaplines = false;
-    static bool visibilityCheck = true;
-    static float chamsColor[4] = {0.320f, 0.520f, 0.950f, 1.0f};
-    static float glowColor[4] = {0.180f, 0.800f, 0.443f, 1.0f};
+    VisualsConfig& state = g_ConfigState.visuals;
 
     SectionBegin("Overlays");
-    ToggleRow("Box ESP", &boxEsp, "Would draw mock bounding boxes in the overlay preview.");
-    ToggleRow("Skeleton ESP", &skeletonEsp, "Would draw mock skeleton lines in a real visual overlay.");
-    ToggleRow("Health Bar", &healthBar, "Would display a mock health bar beside preview targets.");
-    ToggleRow("Name Tags", &nameTags, "Would display mock player names for UI demonstration.");
-    ToggleRow("Distance Text", &distanceText, "Would show mock distance labels in the overlay.");
-    ToggleRow("Snaplines", &snaplines, "Would draw mock lines from the screen edge to preview targets.");
-    ToggleRow("Visibility Check", &visibilityCheck, "Would color mock visuals based on visibility state.");
+    const float overlayWidth = ImGui::GetContentRegionAvail().x;
+    constexpr float previewWidth = 200.0f;
+    constexpr float columnGap = 18.0f;
+    if (overlayWidth >= previewWidth + 230.0f)
+    {
+        const float controlsWidth = overlayWidth - previewWidth - columnGap;
+        ImGui::Columns(2, "##VisualsPreviewColumns", false);
+        ImGui::SetColumnWidth(0, controlsWidth);
+    }
+
+    ToggleRow("Box ESP", &state.boxEsp, "Would draw mock bounding boxes in the overlay preview.");
+    ToggleRow("Skeleton ESP", &state.skeletonEsp, "Would draw mock skeleton lines in a real visual overlay.");
+    ToggleRow("Health Bar", &state.healthBar, "Would display a mock health bar beside preview targets.");
+    ToggleRow("Name Tags", &state.nameTags, "Would display mock player names for UI demonstration.");
+    ToggleRow("Distance Text", &state.distanceText, "Would show mock distance labels in the overlay.");
+    ToggleRow("Snaplines", &state.snaplines, "Would draw mock lines from the screen edge to preview targets.");
+    ToggleRow("Visibility Check", &state.visibilityCheck, "Would color mock visuals based on visibility state.");
+
+    if (overlayWidth >= previewWidth + 230.0f)
+    {
+        ImGui::NextColumn();
+        if (g_FontSmall != nullptr)
+        {
+            ImGui::PushFont(g_FontSmall);
+        }
+        ImGui::TextColored(kMutedText, "Live Preview");
+        if (g_FontSmall != nullptr)
+        {
+            ImGui::PopFont();
+        }
+        ImGui::Spacing();
+        DrawVisualsLivePreview(state);
+        ImGui::Columns(1);
+    }
+    else
+    {
+        ImGui::Spacing();
+        if (g_FontSmall != nullptr)
+        {
+            ImGui::PushFont(g_FontSmall);
+        }
+        ImGui::TextColored(kMutedText, "Live Preview");
+        if (g_FontSmall != nullptr)
+        {
+            ImGui::PopFont();
+        }
+        ImGui::Spacing();
+        DrawVisualsLivePreview(state);
+    }
     SectionEnd();
 
     SectionBegin("Materials");
-    ColorRow("Chams", chamsColor, "Would configure the mock chams material color.");
-    ColorRow("Glow", glowColor, "Would configure the mock glow effect color.");
+    ColorRow("Chams", state.chamsColor.data(), "Would configure the mock chams material color.");
+    ColorRow("Glow", state.glowColor.data(), "Would configure the mock glow effect color.");
     SectionEnd();
 }
 
 void MiscTab()
 {
-    static bool autoAccept = false;
+    MiscConfig& state = g_ConfigState.misc;
 
     SectionBegin("Automation");
-    ToggleRow("Auto Accept", &autoAccept, "Would automatically accept a matchmaking prompt in a real client.");
+    ToggleRow("Auto Accept", &state.autoAccept, "Would automatically accept a matchmaking prompt in a real client.");
     SectionEnd();
 
     SectionBegin("Status");
@@ -1567,11 +2221,11 @@ void ConfigTab()
     RenderHotkeyControls();
 
     SectionBegin("Profiles");
-    PopupButton("Save Config", "Save Config Popup", "Config save preview only. No file I/O was performed.", "Configuration saved successfully", ToastType::Success);
+    SaveConfigButton();
     ImGui::SameLine();
-    PopupButton("Load Config", "Load Config Popup", "Config load preview only. No file I/O was performed.", "Configuration loaded", ToastType::Info);
+    LoadConfigButton();
     ImGui::SameLine();
-    PopupButton("Delete Config", "Delete Config Popup", "Config delete preview only. No file I/O was performed.", "Configuration deleted", ToastType::Warning);
+    DeleteConfigButton();
     PopupButton("Import", "Import Config Popup", "Config import preview only. No file I/O was performed.", "Settings imported", ToastType::Success);
     ImGui::SameLine();
     PopupButton("Export", "Export Config Popup", "Config export preview only. No file I/O was performed.", "Settings exported", ToastType::Success);
@@ -1580,62 +2234,51 @@ void ConfigTab()
 
 void RenderSkinsTab()
 {
-    static int weaponSkin = 0;
-    static int knifeSkin = 0;
-    static int gloveSkin = 0;
+    SkinsConfig& state = g_ConfigState.skins;
     constexpr const char* weaponSkins[] = { "Default", "Crimson", "Graphite", "Neon" };
     constexpr const char* knifeSkins[] = { "Default", "Karambit", "Bayonet", "Butterfly" };
     constexpr const char* gloveSkins[] = { "Default", "Sport", "Driver", "Moto" };
 
     SectionBegin("Inventory");
-    ComboRow("Weapon Skin Changer", &weaponSkin, weaponSkins, 4, "Would select a mock weapon finish preset.");
-    ComboRow("Knife Changer", &knifeSkin, knifeSkins, 4, "Would select a mock knife model preset.");
-    ComboRow("Glove Changer", &gloveSkin, gloveSkins, 4, "Would select a mock glove model preset.");
+    ComboRow("Weapon Skin Changer", &state.weaponSkin, weaponSkins, 4, "Would select a mock weapon finish preset.");
+    ComboRow("Knife Changer", &state.knifeSkin, knifeSkins, 4, "Would select a mock knife model preset.");
+    ComboRow("Glove Changer", &state.gloveSkin, gloveSkins, 4, "Would select a mock glove model preset.");
     SectionEnd();
 }
 
 void RenderWorldTab()
 {
-    static bool fullbright = false;
-    static bool noFog = true;
-    static bool wireframeMode = false;
-    static bool removeGrass = false;
-    static float skyColor[4] = {0.400f, 0.620f, 1.000f, 1.0f};
+    WorldConfig& state = g_ConfigState.world;
 
     SectionBegin("Environment");
-    ToggleRow("Fullbright", &fullbright, "Would brighten the mock environment preview.");
-    ToggleRow("No Fog", &noFog, "Would remove mock fog effects from the preview.");
-    ToggleRow("Wireframe Mode", &wireframeMode, "Would display mock world geometry as wireframes.");
-    ToggleRow("Remove Grass", &removeGrass, "Would hide mock foliage in a real visual module.");
-    ColorRow("Custom Sky", skyColor, "Would choose the mock sky tint.");
+    ToggleRow("Fullbright", &state.fullbright, "Would brighten the mock environment preview.");
+    ToggleRow("No Fog", &state.noFog, "Would remove mock fog effects from the preview.");
+    ToggleRow("Wireframe Mode", &state.wireframeMode, "Would display mock world geometry as wireframes.");
+    ToggleRow("Remove Grass", &state.removeGrass, "Would hide mock foliage in a real visual module.");
+    ColorRow("Custom Sky", state.skyColor.data(), "Would choose the mock sky tint.");
     SectionEnd();
 }
 
 void RenderMovementTab()
 {
-    static bool bunnyHop = false;
-    static bool autoStrafe = true;
-    static bool noFallDamage = false;
-    static float speedMultiplier = 1.0f;
+    MovementConfig& state = g_ConfigState.movement;
 
     SectionBegin("Movement");
-    ToggleRow("Bunny Hop", &bunnyHop, "UI-only placeholder for automated jump timing.");
-    ToggleRow("Auto Strafe", &autoStrafe, "UI-only placeholder for air-strafe assistance.");
-    SliderFloatRow("Speed Multiplier", &speedMultiplier, 0.5f, 3.0f, "%.1fx", "Would scale a mock movement speed value.");
-    ToggleRow("No Fall Damage", &noFallDamage, "UI-only placeholder for fall-damage prevention.");
+    ToggleRow("Bunny Hop", &state.bunnyHop, "UI-only placeholder for automated jump timing.");
+    ToggleRow("Auto Strafe", &state.autoStrafe, "UI-only placeholder for air-strafe assistance.");
+    SliderFloatRow("Speed Multiplier", &state.speedMultiplier, 0.5f, 3.0f, "%.1fx", "Would scale a mock movement speed value.");
+    ToggleRow("No Fall Damage", &state.noFallDamage, "UI-only placeholder for fall-damage prevention.");
     SectionEnd();
 }
 
 void RenderPlayerTab()
 {
-    static bool thirdPersonToggle = false;
-    static bool antiAfk = true;
-    static float customFov = 100.0f;
+    PlayerConfig& state = g_ConfigState.player;
 
     SectionBegin("Camera");
-    ToggleRow("Third Person Toggle", &thirdPersonToggle, "Would switch to a mock third-person camera preview.");
-    SliderFloatRow("Custom FOV", &customFov, 60.0f, 140.0f, "%.0f", "Would adjust the mock player camera field of view.");
-    ToggleRow("Anti-AFK", &antiAfk, "UI-only placeholder for anti-idle behavior.");
+    ToggleRow("Third Person Toggle", &state.thirdPersonToggle, "Would switch to a mock third-person camera preview.");
+    SliderFloatRow("Custom FOV", &state.customFov, 60.0f, 140.0f, "%.0f", "Would adjust the mock player camera field of view.");
+    ToggleRow("Anti-AFK", &state.antiAfk, "UI-only placeholder for anti-idle behavior.");
     SectionEnd();
 
     SectionBegin("Spectators");
@@ -1698,7 +2341,12 @@ void RenderMainPanelTabs()
         ImGui::GetWindowDrawList(),
         panelPos,
         ImVec2(panelPos.x + panelSize.x, panelPos.y + panelSize.y),
-        10.0f);
+        kOuterWindowRounding);
+    DrawAcrylicPanelSurface(
+        ImGui::GetWindowDrawList(),
+        panelPos,
+        ImVec2(panelPos.x + panelSize.x, panelPos.y + panelSize.y),
+        kOuterWindowRounding);
     DrawPremiumTopStrip(
         ImGui::GetWindowDrawList(),
         panelPos,
@@ -1721,8 +2369,8 @@ void RenderMainPanelTabs()
         ImGui::GetWindowDrawList(),
         contentPos,
         ImVec2(contentPos.x + contentSize.x, contentPos.y + contentSize.y),
-        8.0f);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.055f, 0.064f, 1.0f));
+        kSectionRounding);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.055f, 0.064f, 0.86f));
     ImGui::BeginChild("Content", ImVec2(0.0f, 0.0f), true);
     DrawContentBackgroundDepth(
         ImGui::GetWindowDrawList(),
@@ -1758,7 +2406,7 @@ void RenderMainPanelTabs()
     {
         ImGui::PopFont();
     }
-    RenderSearchBar();
+    ImGui::Spacing();
 
     const double now = ImGui::GetTime();
     const float transitionProgress = categorySwitchStart >= 0.0

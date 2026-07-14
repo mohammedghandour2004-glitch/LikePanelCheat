@@ -4,6 +4,7 @@ _deps/
 CMakeFiles/
 CMakeCache.txt
 imgui.ini
+configs/*.json
 *.exe
 *.dll
 *.obj
