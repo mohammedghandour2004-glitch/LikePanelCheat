@@ -43,7 +43,7 @@ The result is a polished, interactive panel that behaves like a complete product
 ![Main Panel](screenshots/main-panel.png)
 ![Welcome Screen](screenshots/welcome-screen.png)
 ![Theme Customization](screenshots/theme-colors.png)
-![Config Hotkeys](screenshots/hotkeys.png)
+![Settings](screenshots/settings.png)
 
 ## Build Instructions
 
