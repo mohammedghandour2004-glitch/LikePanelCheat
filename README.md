@@ -134,5 +134,5 @@ This project is licensed under the MIT License. See [LICENSE](LICENSE) for detai
 ## Author
 
 - Name: Your Name
-- GitHub: https://github.com/your-username
-- LinkedIn: https://www.linkedin.com/in/your-profile
+- GitHub: [https://github.com/your-username](https://github.com/mohammedghandour2004-glitch)
+- LinkedIn: www.linkedin.com/in/mohammed-ghandour-auto
