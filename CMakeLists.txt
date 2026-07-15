@@ -78,19 +78,40 @@ if(MINGW)
     )
 endif()
 
+if(MINGW)
+    find_program(WINDRES_EXECUTABLE NAMES windres REQUIRED)
+    set(APP_ICON_OBJECT "${CMAKE_CURRENT_BINARY_DIR}/app_icon.o")
+    add_custom_command(
+        OUTPUT "${APP_ICON_OBJECT}"
+        COMMAND "${WINDRES_EXECUTABLE}" -O coff -DIDI_ICON1=101 "${CMAKE_CURRENT_SOURCE_DIR}/src/app.rc" "${APP_ICON_OBJECT}"
+        DEPENDS
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/app.rc"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/resource.h"
+            "${CMAKE_CURRENT_SOURCE_DIR}/assets/icon.ico"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        VERBATIM
+    )
+else()
+    set(APP_ICON_OBJECT "src/app.rc")
+endif()
+
 add_executable(EazyE_HEX WIN32
     src/ConfigManager.cpp
     src/ConfigManager.h
     src/ImageLoader.cpp
     src/ImageLoader.h
+    "${APP_ICON_OBJECT}"
     src/main.cpp
     src/PanelUI.cpp
     src/PanelUI.h
+    src/resource.h
     src/Theme.cpp
     src/Theme.h
 )
 
 target_include_directories(EazyE_HEX PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/json"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/stb"
 )

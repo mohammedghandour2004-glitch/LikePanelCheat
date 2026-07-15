@@ -202,11 +202,10 @@ ConfigSaveResult SaveConfigToFile(const std::string& profileName)
     {
         return result;
     }
-    const std::string safeProfileName = TrimProfileName(profileName);
     const std::int64_t lastSessionTimestamp = ReadLastSessionTimestampFromFile(fullPath);
 
     const json document = {
-        {"profile", safeProfileName},
+        {"profile", GetProfileName()},
         {"profilePicturePath", GetProfilePicturePath()},
         {"lastSessionTimestamp", lastSessionTimestamp},
         {"theme", {
@@ -259,6 +258,13 @@ ConfigSaveResult SaveConfigToFile(const std::string& profileName)
         }},
         {"misc", {
             {"autoAccept", g_ConfigState.misc.autoAccept}
+        }},
+        {"panel", {
+            {"animationSpeed", g_ConfigState.panel.animationSpeed},
+            {"panelOpacity", g_ConfigState.panel.panelOpacity},
+            {"reduceMotion", g_ConfigState.panel.reduceMotion},
+            {"startMinimized", g_ConfigState.panel.startMinimized},
+            {"autoHideOnFocusLoss", g_ConfigState.panel.autoHideOnFocusLoss}
         }}
     };
 
@@ -324,6 +330,7 @@ ConfigSaveResult LoadConfigFromFile(const std::string& profileName)
         {
             g_ToggleHotkey = document["hotkeys"].value("togglePanel", g_ToggleHotkey);
         }
+        SetProfileName(document.value("profile", profileName).c_str());
         const std::string profilePicturePath = document.value("profilePicturePath", std::string());
         if (!profilePicturePath.empty())
         {
@@ -413,6 +420,15 @@ ConfigSaveResult LoadConfigFromFile(const std::string& profileName)
         {
             g_ConfigState.misc.autoAccept = document["misc"].value("autoAccept", g_ConfigState.misc.autoAccept);
         }
+        if (document.contains("panel"))
+        {
+            const json& value = document["panel"];
+            g_ConfigState.panel.animationSpeed = value.value("animationSpeed", g_ConfigState.panel.animationSpeed);
+            g_ConfigState.panel.panelOpacity = value.value("panelOpacity", g_ConfigState.panel.panelOpacity);
+            g_ConfigState.panel.reduceMotion = value.value("reduceMotion", g_ConfigState.panel.reduceMotion);
+            g_ConfigState.panel.startMinimized = value.value("startMinimized", g_ConfigState.panel.startMinimized);
+            g_ConfigState.panel.autoHideOnFocusLoss = value.value("autoHideOnFocusLoss", g_ConfigState.panel.autoHideOnFocusLoss);
+        }
     }
     catch (const json::exception& exception)
     {
@@ -496,7 +512,7 @@ ConfigSaveResult UpdateLastSessionTimestamp(const std::string& profileName, std:
         }
     }
 
-    document["profile"] = TrimProfileName(profileName);
+    document["profile"] = GetProfileName();
     document["lastSessionTimestamp"] = timestamp;
 
     std::ofstream output(fullPath, std::ios::out | std::ios::trunc);

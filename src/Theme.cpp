@@ -4,6 +4,7 @@
 
 #include <cstdio>
 
+#include "ConfigManager.h"
 #include "imgui_internal.h"
 
 namespace
@@ -13,6 +14,9 @@ constexpr ImVec4 kPanel = ImVec4(0.075f, 0.075f, 0.086f, 1.0f);
 constexpr ImVec4 kPanelHover = ImVec4(0.105f, 0.105f, 0.125f, 1.0f);
 constexpr ImVec4 kText = ImVec4(0.925f, 0.925f, 0.950f, 1.0f);
 constexpr ImVec4 kTextMuted = ImVec4(0.580f, 0.580f, 0.640f, 1.0f);
+constexpr float kAnimFast = 0.10f;
+constexpr float kAnimMedium = 0.20f;
+constexpr float kAnimStandard = 0.25f;
 
 bool FileExists(const char* path)
 {
@@ -46,10 +50,26 @@ float Clamp01(float value)
     return value;
 }
 
+float EaseOutCubic(float value)
+{
+    const float t = 1.0f - Clamp01(value);
+    return 1.0f - t * t * t;
+}
+
+float EaseInOutCubic(float value)
+{
+    const float t = Clamp01(value);
+    return t < 0.5f
+        ? 4.0f * t * t * t
+        : 1.0f - ImPow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+}
+
 float Approach(float current, float target, float responseSeconds)
 {
     const float dt = ImGui::GetIO().DeltaTime;
-    const float step = responseSeconds > 0.0f ? Clamp01(dt / responseSeconds) : 1.0f;
+    const float speed = g_ConfigState.panel.animationSpeed < 0.5f ? 0.5f : (g_ConfigState.panel.animationSpeed > 2.0f ? 2.0f : g_ConfigState.panel.animationSpeed);
+    const float adjustedResponse = responseSeconds / speed;
+    const float step = adjustedResponse > 0.0f ? EaseOutCubic(dt / adjustedResponse) : 1.0f;
     return current + (target - current) * step;
 }
 }
@@ -263,40 +283,86 @@ bool ToggleSwitch(const char* label, bool* value)
     if (pressed)
     {
         *value = !*value;
+        if (*value)
+        {
+            window->StateStorage.SetFloat(id + 3, static_cast<float>(ImGui::GetTime()));
+        }
         ImGui::MarkItemEdited(id);
     }
 
+    float* hoverT = window->StateStorage.GetFloatRef(id + 4, 0.0f);
+    float* pressT = window->StateStorage.GetFloatRef(id + 5, 0.0f);
+    *hoverT = Approach(*hoverT, hovered || held ? 1.0f : 0.0f, kAnimFast);
+    *pressT = Approach(*pressT, held ? 1.0f : 0.0f, held ? kAnimFast * 0.35f : kAnimFast);
+
     float* knobT = window->StateStorage.GetFloatRef(id + 1, *value ? 1.0f : 0.0f);
-    *knobT = Approach(*knobT, *value ? 1.0f : 0.0f, 0.12f);
+    *knobT = Approach(*knobT, *value ? 1.0f : 0.0f, kAnimMedium);
     const float t = *knobT;
+    const float drawScale = 1.0f + *hoverT * 0.020f - *pressT * 0.050f;
+    const ImVec2 switchCenter((switchRect.Min.x + switchRect.Max.x) * 0.5f, (switchRect.Min.y + switchRect.Max.y) * 0.5f);
+    const ImVec2 switchHalf((switchRect.Max.x - switchRect.Min.x) * 0.5f * drawScale, (switchRect.Max.y - switchRect.Min.y) * 0.5f * drawScale);
+    const ImRect drawSwitchRect(
+        ImVec2(switchCenter.x - switchHalf.x, switchCenter.y - switchHalf.y),
+        ImVec2(switchCenter.x + switchHalf.x, switchCenter.y + switchHalf.y));
+    const float drawRadius = radius * drawScale;
 
     const ImU32 trackColor = ImGui::GetColorU32(*value
         ? (hovered ? GetAccentHoverColor() : g_AccentColor)
         : (hovered ? ImVec4(0.240f, 0.240f, 0.280f, 1.0f) : ImVec4(0.160f, 0.160f, 0.190f, 1.0f)));
     const ImU32 knobColor = ImGui::GetColorU32(ImVec4(0.940f, 0.940f, 0.970f, 1.0f));
 
-    window->DrawList->AddRectFilled(switchRect.Min, switchRect.Max, trackColor, radius);
-    if (*value)
+    if (*hoverT > 0.001f || *pressT > 0.001f)
     {
         window->DrawList->AddRect(
-            ImVec2(switchRect.Min.x + 1.0f, switchRect.Min.y + 1.0f),
-            ImVec2(switchRect.Max.x - 1.0f, switchRect.Max.y - 1.0f),
-            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.20f)),
-            radius,
+            ImVec2(drawSwitchRect.Min.x - 2.0f, drawSwitchRect.Min.y - 2.0f),
+            ImVec2(drawSwitchRect.Max.x + 2.0f, drawSwitchRect.Max.y + 2.0f),
+            ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, *hoverT * 0.24f + *pressT * 0.12f)),
+            drawRadius + 2.0f,
             0,
-            1.0f);
+            2.0f);
         window->DrawList->AddRect(
-            ImVec2(switchRect.Min.x + 3.0f, switchRect.Min.y + 3.0f),
-            ImVec2(switchRect.Max.x - 3.0f, switchRect.Max.y - 3.0f),
-            ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.30f)),
-            radius - 2.0f,
+            ImVec2(drawSwitchRect.Min.x - 5.0f, drawSwitchRect.Min.y - 5.0f),
+            ImVec2(drawSwitchRect.Max.x + 5.0f, drawSwitchRect.Max.y + 5.0f),
+            ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, *hoverT * 0.09f)),
+            drawRadius + 5.0f,
             0,
             1.0f);
     }
 
-    const float knobRadius = radius - 3.0f;
-    const float knobX = ImLerp(switchRect.Min.x + radius, switchRect.Max.x - radius, t);
-    const ImVec2 knobCenter(knobX, switchRect.Min.y + radius);
+    window->DrawList->AddRectFilled(drawSwitchRect.Min, drawSwitchRect.Max, trackColor, drawRadius);
+    if (*value)
+    {
+        window->DrawList->AddRect(
+            ImVec2(drawSwitchRect.Min.x + 1.0f, drawSwitchRect.Min.y + 1.0f),
+            ImVec2(drawSwitchRect.Max.x - 1.0f, drawSwitchRect.Max.y - 1.0f),
+            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.20f)),
+            drawRadius,
+            0,
+            1.0f);
+        window->DrawList->AddRect(
+            ImVec2(drawSwitchRect.Min.x + 3.0f, drawSwitchRect.Min.y + 3.0f),
+            ImVec2(drawSwitchRect.Max.x - 3.0f, drawSwitchRect.Max.y - 3.0f),
+            ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.30f)),
+            drawRadius - 2.0f,
+            0,
+            1.0f);
+    }
+
+    const float knobRadius = drawRadius - 3.0f;
+    const float knobX = ImLerp(drawSwitchRect.Min.x + drawRadius, drawSwitchRect.Max.x - drawRadius, t);
+    const ImVec2 knobCenter(knobX, drawSwitchRect.Min.y + drawRadius);
+    const float burstStart = window->StateStorage.GetFloat(id + 3, -10.0f);
+    const float burstAge = static_cast<float>(ImGui::GetTime()) - burstStart;
+    if (burstAge >= 0.0f && burstAge < kAnimStandard)
+    {
+        const float burstT = EaseInOutCubic(burstAge / kAnimStandard);
+        const float burstAlpha = (1.0f - burstT) * 0.34f;
+        window->DrawList->AddCircleFilled(
+            knobCenter,
+            knobRadius + 8.0f + 14.0f * EaseOutCubic(burstT),
+            ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, burstAlpha)),
+            40);
+    }
     if (hovered || held || *value)
     {
         const float glowAlpha = held ? 0.30f : (hovered ? 0.22f : 0.14f);

@@ -63,6 +63,15 @@ struct MiscConfig
     bool autoAccept = false;
 };
 
+struct PanelConfig
+{
+    float animationSpeed = 1.0f;
+    float panelOpacity = 1.0f;
+    bool reduceMotion = false;
+    bool startMinimized = false;
+    bool autoHideOnFocusLoss = false;
+};
+
 struct UiConfigState
 {
     AimbotConfig aimbot;
@@ -72,6 +81,7 @@ struct UiConfigState
     MovementConfig movement;
     PlayerConfig player;
     MiscConfig misc;
+    PanelConfig panel;
 };
 
 struct ConfigSaveResult

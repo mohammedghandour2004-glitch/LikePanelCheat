@@ -8,7 +8,9 @@
 #include "imgui.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
+#include "ConfigManager.h"
 #include "PanelUI.h"
+#include "resource.h"
 #include "Theme.h"
 
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -30,6 +32,7 @@ static UINT g_ResizeWidth = 0;
 static UINT g_ResizeHeight = 0;
 static bool g_UseRegisteredHotkey = false;
 static bool g_PreviousToggleKeyDown = false;
+static bool g_FocusLossPending = false;
 static constexpr int kAuthWindowWidth = 360;
 static constexpr int kAuthWindowHeight = 440;
 static constexpr int kWindowWidth = 760;
@@ -37,17 +40,21 @@ static constexpr int kWindowHeight = 520;
 static constexpr int kWindowCornerRadius = 16;
 static constexpr int kToggleHotkeyId = 0xE22F;
 static constexpr double kSplashDuration = 2.0;
-static constexpr double kSplashFadeDuration = 0.30;
+static constexpr float kAnimFast = 0.10f;
+static constexpr float kAnimMedium = 0.20f;
+static constexpr float kAnimStandard = 0.25f;
+static constexpr float kAnimSlow = 0.35f;
+static constexpr double kSplashFadeDuration = kAnimSlow;
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 static void EndWindowDrag(HWND hwnd);
+static void ApplyWindowIcons(HWND hwnd, HINSTANCE hInstance);
 
 enum class PanelVisibilityState
 {
     Visible,
     Hiding,
-    HiddenMessage,
     Hidden,
     Showing
 };
@@ -67,14 +74,12 @@ static float Clamp01(float value)
 
 static float EaseOutCubic(float value)
 {
-    const float t = 1.0f - Clamp01(value);
-    return 1.0f - t * t * t;
+    return PanelEaseOut(value);
 }
 
-static float EaseInCubic(float value)
+static float EaseInOutCubic(float value)
 {
-    const float t = Clamp01(value);
-    return t * t * t;
+    return PanelEaseInOut(value);
 }
 
 static void RequestPanelToggle(HWND hwnd, PanelVisibilityState& visibilityState, double& transitionStart)
@@ -116,48 +121,39 @@ static void UpdateHotkeyRegistration(HWND hwnd, int& registeredHotkey)
     }
 }
 
-static void RenderPanelHiddenMessage()
+static HICON LoadAppIcon(HINSTANCE hInstance, int width, int height)
 {
-    const ImVec2 windowSize(static_cast<float>(kWindowWidth), static_cast<float>(kWindowHeight));
-    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
-    ImGui::SetNextWindowSize(windowSize, ImGuiCond_Always);
-    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0.0f, 0.0f));
-    ImGui::Begin(
-        "EazyE HEX Hidden Hint",
-        nullptr,
-        ImGuiWindowFlags_NoTitleBar |
-            ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoScrollWithMouse |
-            ImGuiWindowFlags_NoInputs);
+    return static_cast<HICON>(LoadImageA(
+        hInstance,
+        MAKEINTRESOURCEA(IDI_ICON1),
+        IMAGE_ICON,
+        width,
+        height,
+        LR_DEFAULTCOLOR | LR_SHARED));
+}
 
-    char message[96] = {};
-    std::snprintf(message, sizeof(message), "Panel Hidden - Press %s to restore", GetToggleHotkeyName());
-    const ImVec2 textSize = ImGui::CalcTextSize(message);
-    const ImVec2 cardSize(textSize.x + 42.0f, textSize.y + 26.0f);
-    const ImVec2 cardMin((windowSize.x - cardSize.x) * 0.5f, (windowSize.y - cardSize.y) * 0.5f);
-    const ImVec2 cardMax(cardMin.x + cardSize.x, cardMin.y + cardSize.y);
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
+static void ApplyWindowIcons(HWND hwnd, HINSTANCE hInstance)
+{
+    HICON bigIcon = LoadAppIcon(hInstance, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    HICON smallIcon = LoadAppIcon(hInstance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
 
-    for (int i = 0; i < 3; ++i)
+    if (bigIcon == nullptr)
     {
-        const float spread = 3.0f + static_cast<float>(i) * 3.0f;
-        drawList->AddRectFilled(
-            ImVec2(cardMin.x + 4.0f - spread, cardMin.y + 5.0f - spread),
-            ImVec2(cardMax.x + 4.0f + spread, cardMax.y + 5.0f + spread),
-            ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.18f - static_cast<float>(i) * 0.045f)),
-            9.0f + spread);
+        bigIcon = LoadIconA(hInstance, MAKEINTRESOURCEA(IDI_ICON1));
     }
-    drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(ImVec4(0.060f, 0.060f, 0.072f, 0.94f)), 12.0f);
-    drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(ImVec4(g_AccentColor.x, g_AccentColor.y, g_AccentColor.z, 0.45f)), 12.0f, 0, 1.0f);
-    drawList->AddText(ImVec2(cardMin.x + 21.0f, cardMin.y + 13.0f), ImGui::GetColorU32(ImVec4(0.880f, 0.875f, 0.920f, 1.0f)), message);
+    if (smallIcon == nullptr)
+    {
+        smallIcon = bigIcon;
+    }
 
-    ImGui::End();
-    ImGui::PopStyleVar(2);
-    ImGui::PopStyleColor();
+    if (bigIcon != nullptr)
+    {
+        SendMessageA(hwnd, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(bigIcon));
+    }
+    if (smallIcon != nullptr)
+    {
+        SendMessageA(hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(smallIcon));
+    }
 }
 
 static void CleanupRenderTarget()
@@ -575,6 +571,15 @@ static LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg)
     {
+    case WM_ACTIVATE:
+        if (LOWORD(wParam) == WA_INACTIVE)
+        {
+            g_FocusLossPending = true;
+        }
+        break;
+    case WM_KILLFOCUS:
+        g_FocusLossPending = true;
+        break;
     case WM_LBUTTONDOWN:
     {
         POINT cursor = {};
@@ -633,6 +638,8 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     wc.style = CS_OWNDC;
     wc.lpfnWndProc = WndProc;
     wc.hInstance = hInstance;
+    wc.hIcon = LoadAppIcon(hInstance, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    wc.hIconSm = LoadAppIcon(hInstance, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     wc.lpszClassName = "EazyE HEX Overlay";
     RegisterClassExA(&wc);
 
@@ -650,6 +657,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         nullptr,
         wc.hInstance,
         nullptr);
+    ApplyWindowIcons(hwnd, hInstance);
 
     if (!CreateDeviceD3D(hwnd))
     {
@@ -674,6 +682,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
     SetPanelD3DDevice(g_pd3dDevice);
+    (void)LoadConfigFromFile("Default");
     int registeredHotkey = 0;
     UpdateHotkeyRegistration(hwnd, registeredHotkey);
 
@@ -708,6 +717,16 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         if (done)
         {
             break;
+        }
+
+        if (g_FocusLossPending)
+        {
+            g_FocusLossPending = false;
+            if (IsAutoHideOnFocusLossEnabled() &&
+                (visibilityState == PanelVisibilityState::Visible || visibilityState == PanelVisibilityState::Showing))
+            {
+                RequestPanelToggle(hwnd, visibilityState, visibilityTransitionStart);
+            }
         }
         const double frameStartTime = ImGui::GetTime();
 
@@ -750,21 +769,25 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
+        UpdateAutoConfigSave();
 
         static double panelOpenStart = -1.0;
         static double welcomeExitStart = -1.0;
         static bool welcomeAccepted = false;
         const double now = ImGui::GetTime();
+        const double splashDuration = PanelAnimationDuration(kSplashDuration);
+        const double splashFadeDuration = PanelAnimationDuration(kSplashFadeDuration);
+        const double welcomeExitDuration = PanelAnimationDuration(kAnimSlow);
         const double splashElapsed = now - appStartTime;
-        const bool splashOnly = splashElapsed < kSplashDuration;
-        const bool splashFading = splashElapsed >= kSplashDuration && splashElapsed < kSplashDuration + kSplashFadeDuration;
-        const bool splashComplete = splashElapsed >= kSplashDuration + kSplashFadeDuration;
-        const bool welcomeExiting = welcomeExitStart >= 0.0 && now - welcomeExitStart < 0.30;
+        const bool splashOnly = splashElapsed < splashDuration;
+        const bool splashFading = splashElapsed >= splashDuration && splashElapsed < splashDuration + splashFadeDuration;
+        const bool splashComplete = splashElapsed >= splashDuration + splashFadeDuration;
+        const bool welcomeExiting = welcomeExitStart >= 0.0 && now - welcomeExitStart < welcomeExitDuration;
         if (!welcomeAccepted && welcomeExitStart >= 0.0 && panelOpenStart < 0.0)
         {
             panelOpenStart = welcomeExitStart;
         }
-        if (!welcomeAccepted && welcomeExitStart >= 0.0 && now - welcomeExitStart >= 0.30)
+        if (!welcomeAccepted && welcomeExitStart >= 0.0 && now - welcomeExitStart >= welcomeExitDuration)
         {
             welcomeAccepted = true;
         }
@@ -773,32 +796,19 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         float visibilityAlpha = 1.0f;
         float visibilityScale = 1.0f;
         bool renderPanel = !splashOnly && !splashFading && (welcomeAccepted || welcomeExiting);
-        bool renderHiddenMessage = false;
 
         if (visibilityState == PanelVisibilityState::Hiding)
         {
-            const float hideT = Clamp01(static_cast<float>((now - visibilityTransitionStart) / 0.15));
-            const float eased = EaseInCubic(hideT);
+            const float hideT = Clamp01(static_cast<float>((now - visibilityTransitionStart) / PanelAnimationDuration(kAnimMedium)));
+            const float eased = EaseInOutCubic(hideT);
             visibilityAlpha = 1.0f - eased;
             visibilityScale = 1.0f - (0.04f * eased);
             if (hideT >= 1.0f)
             {
-                visibilityState = PanelVisibilityState::HiddenMessage;
-                visibilityTransitionStart = now;
-                renderPanel = false;
-                renderHiddenMessage = true;
-            }
-        }
-        else if (visibilityState == PanelVisibilityState::HiddenMessage)
-        {
-            renderPanel = false;
-            renderHiddenMessage = true;
-            if (now - visibilityTransitionStart >= 1.5)
-            {
                 visibilityState = PanelVisibilityState::Hidden;
                 ShowWindow(hwnd, SW_HIDE);
                 g_PanelDragAreaScreen = {};
-                renderHiddenMessage = false;
+                renderPanel = false;
             }
         }
         else if (visibilityState == PanelVisibilityState::Hidden)
@@ -807,7 +817,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         }
         else if (visibilityState == PanelVisibilityState::Showing)
         {
-            const float showT = EaseOutCubic(static_cast<float>((now - visibilityTransitionStart) / 0.15));
+            const float showT = EaseOutCubic(static_cast<float>((now - visibilityTransitionStart) / PanelAnimationDuration(kAnimMedium)));
             visibilityAlpha = showT;
             visibilityScale = 0.94f + (0.06f * showT);
             if (showT >= 1.0f)
@@ -819,7 +829,7 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         }
 
         const float openT = panelOpenStart >= 0.0
-            ? EaseOutCubic(static_cast<float>((now - panelOpenStart) / 0.25))
+            ? EaseOutCubic(static_cast<float>((now - panelOpenStart) / PanelAnimationDuration(kAnimStandard)))
             : 0.0f;
         if (renderPanel)
         {
@@ -848,15 +858,10 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
             g_PanelDragAreaScreen = {};
         }
 
-        if (renderHiddenMessage)
-        {
-            RenderPanelHiddenMessage();
-        }
-
         if (renderWelcome)
         {
             const float welcomeFadeOut = welcomeExiting
-                ? 1.0f - EaseOutCubic(static_cast<float>((now - welcomeExitStart) / 0.30))
+                ? 1.0f - EaseOutCubic(static_cast<float>((now - welcomeExitStart) / welcomeExitDuration))
                 : 1.0f;
             ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
             ImGui::SetNextWindowSize(ImVec2(static_cast<float>(mainWindowSizeApplied ? kWindowWidth : kAuthWindowWidth), static_cast<float>(mainWindowSizeApplied ? kWindowHeight : kAuthWindowHeight)), ImGuiCond_Always);
@@ -898,9 +903,9 @@ int APIENTRY WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
         if (splashOnly || splashFading)
         {
             const float splashAlpha = splashFading
-                ? 1.0f - EaseOutCubic(static_cast<float>((splashElapsed - kSplashDuration) / kSplashFadeDuration))
+                ? 1.0f - EaseOutCubic(static_cast<float>((splashElapsed - splashDuration) / splashFadeDuration))
                 : 1.0f;
-            const float progress = static_cast<float>(splashElapsed / kSplashDuration);
+            const float progress = static_cast<float>(splashElapsed / splashDuration);
             ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f), ImGuiCond_Always);
             ImGui::SetNextWindowSize(ImVec2(static_cast<float>(kAuthWindowWidth), static_cast<float>(kAuthWindowHeight)), ImGuiCond_Always);
             ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 0.0f);

@@ -22,10 +22,44 @@ ID3D11ShaderResourceView* g_ProfileAvatarTexture = nullptr;
 int g_ProfileAvatarWidth = 0;
 int g_ProfileAvatarHeight = 0;
 std::string g_ProfilePicturePath;
+char g_ProfileName[32] = "Default";
+static constexpr const char* kAutoConfigProfileName = "Default";
+static constexpr double kAutoSaveDelaySeconds = 0.45;
+static constexpr float kAnimFast = 0.10f;
+static constexpr float kAnimMedium = 0.20f;
+static constexpr float kAnimStandard = 0.25f;
+static constexpr float kAnimSlow = 0.35f;
+static bool g_AutoSavePending = false;
+static double g_AutoSaveDueTime = 0.0;
+static bool g_AccentTransitionActive = false;
+static ImVec4 g_AccentTransitionStart;
+static ImVec4 g_AccentTransitionTarget;
+static double g_AccentTransitionStartTime = 0.0;
+
+static void RequestAutoConfigSave()
+{
+    g_AutoSavePending = true;
+    g_AutoSaveDueTime = ImGui::GetTime() + kAutoSaveDelaySeconds;
+}
+
+static void SaveAutoConfigNow()
+{
+    (void)SaveConfigToFile(kAutoConfigProfileName);
+}
 
 void SetPanelD3DDevice(ID3D11Device* device)
 {
     g_PanelD3DDevice = device;
+}
+
+const char* GetProfileName()
+{
+    return g_ProfileName;
+}
+
+void SetProfileName(const char* profileName)
+{
+    std::snprintf(g_ProfileName, sizeof(g_ProfileName), "%s", profileName != nullptr ? profileName : "Default");
 }
 
 const char* GetProfilePicturePath()
@@ -71,6 +105,47 @@ bool LoadProfilePictureFromPath(const char* path)
     g_ProfileAvatarHeight = loadedHeight;
     g_ProfilePicturePath = path;
     return true;
+}
+
+void UpdateAutoConfigSave()
+{
+    if (!g_AutoSavePending || ImGui::GetTime() < g_AutoSaveDueTime)
+    {
+        return;
+    }
+
+    SaveAutoConfigNow();
+    g_AutoSavePending = false;
+}
+
+bool IsAutoHideOnFocusLossEnabled()
+{
+    return g_ConfigState.panel.autoHideOnFocusLoss;
+}
+
+float PanelAnimationDuration(float baseSeconds)
+{
+    const float speed = g_ConfigState.panel.animationSpeed < 0.5f ? 0.5f : (g_ConfigState.panel.animationSpeed > 2.0f ? 2.0f : g_ConfigState.panel.animationSpeed);
+    return baseSeconds / speed;
+}
+
+float PanelEaseOut(float value)
+{
+    const float t = 1.0f - (value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value));
+    return 1.0f - t * t * t;
+}
+
+float PanelEaseInOut(float value)
+{
+    const float t = value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+    return t < 0.5f
+        ? 4.0f * t * t * t
+        : 1.0f - std::pow(-2.0f * t + 2.0f, 3.0f) * 0.5f;
+}
+
+float PanelOpacity()
+{
+    return g_ConfigState.panel.panelOpacity < 0.60f ? 0.60f : (g_ConfigState.panel.panelOpacity > 1.0f ? 1.0f : g_ConfigState.panel.panelOpacity);
 }
 
 const char* GetToggleHotkeyName()
@@ -128,7 +203,8 @@ enum class Category
     Movement,
     Player,
     Misc,
-    Config
+    Config,
+    Settings
 };
 
 enum class ToastType
@@ -153,6 +229,42 @@ struct Toast
     float yOffset;
 };
 
+struct InteractionRipple
+{
+    ImGuiID itemId;
+    ImVec2 center;
+    double startTime;
+    float maxRadius;
+};
+
+struct BorderPathPoint
+{
+    ImVec2 pos;
+    float distance;
+};
+
+struct SectionFrameState
+{
+    ImGuiID id;
+};
+
+struct SectionHoverState
+{
+    ImGuiID id;
+    float progress;
+    ImVec2 min;
+    ImVec2 max;
+    bool hasBounds;
+};
+
+struct BrandGlitchSample
+{
+    bool active;
+    float progress;
+    float intensity;
+    float seed;
+};
+
 constexpr CategoryItem kCategories[] = {
     { Category::Aimbot, "Aimbot" },
     { Category::Visuals, "Visuals" },
@@ -162,10 +274,16 @@ constexpr CategoryItem kCategories[] = {
     { Category::Player, "Player" },
     { Category::Misc, "Misc" },
     { Category::Config, "Config" },
+    { Category::Settings, "Settings" },
 };
 
 std::vector<Toast> g_Toasts;
-char g_ProfileName[32] = "Default";
+std::vector<InteractionRipple> g_Ripples;
+std::vector<SectionFrameState> g_SectionStack;
+std::vector<SectionHoverState> g_SectionHoverStates;
+constexpr size_t kMaxActiveRipples = 10;
+constexpr float kRippleDuration = kAnimSlow;
+constexpr float kSectionLiftDuration = 0.15f;
 
 struct KeyOption
 {
@@ -272,15 +390,161 @@ float Clamp01(float value)
 
 float EaseOutCubic(float value)
 {
-    const float t = 1.0f - Clamp01(value);
-    return 1.0f - t * t * t;
+    return PanelEaseOut(value);
+}
+
+float EaseInOutCubic(float value)
+{
+    return PanelEaseInOut(value);
 }
 
 float Approach(float current, float target, float responseSeconds)
 {
     const float dt = ImGui::GetIO().DeltaTime;
-    const float step = responseSeconds > 0.0f ? Clamp01(dt / responseSeconds) : 1.0f;
+    const float adjustedResponse = PanelAnimationDuration(responseSeconds);
+    const float step = adjustedResponse > 0.0f ? EaseOutCubic(dt / adjustedResponse) : 1.0f;
     return current + (target - current) * step;
+}
+
+float ExponentialSmooth(float current, float target, float responseSeconds)
+{
+    const float dt = ImGui::GetIO().DeltaTime;
+    const float adjustedResponse = PanelAnimationDuration(responseSeconds);
+    const float normalizedDt = adjustedResponse > 0.0f ? dt / adjustedResponse : 1.0f;
+    const float step = adjustedResponse > 0.0f ? Clamp01(1.0f - std::pow(0.001f, normalizedDt)) : 1.0f;
+    return current + (target - current) * step;
+}
+
+SectionHoverState& GetSectionHoverState(ImGuiID sectionId)
+{
+    for (SectionHoverState& state : g_SectionHoverStates)
+    {
+        if (state.id == sectionId)
+        {
+            return state;
+        }
+    }
+
+    g_SectionHoverStates.push_back({ sectionId, 0.0f, ImVec2(0.0f, 0.0f), ImVec2(0.0f, 0.0f), false });
+    return g_SectionHoverStates.back();
+}
+
+void StartAccentTransition(ImVec4 target)
+{
+    g_AccentTransitionStart = g_AccentColor;
+    g_AccentTransitionTarget = target;
+    g_AccentTransitionTarget.w = 1.0f;
+    g_AccentTransitionStartTime = ImGui::GetTime();
+    g_AccentTransitionActive = true;
+}
+
+void UpdateAccentTransition()
+{
+    if (!g_AccentTransitionActive)
+    {
+        return;
+    }
+
+    const float t = Clamp01(static_cast<float>((ImGui::GetTime() - g_AccentTransitionStartTime) / PanelAnimationDuration(kAnimStandard)));
+    g_AccentColor = LerpColor(g_AccentTransitionStart, g_AccentTransitionTarget, EaseInOutCubic(t));
+    g_AccentColor.w = 1.0f;
+    if (t >= 1.0f)
+    {
+        g_AccentColor = g_AccentTransitionTarget;
+        g_AccentTransitionActive = false;
+    }
+}
+
+void ScaleRectAroundCenter(ImVec2 min, ImVec2 max, float scale, ImVec2& scaledMin, ImVec2& scaledMax)
+{
+    const ImVec2 center((min.x + max.x) * 0.5f, (min.y + max.y) * 0.5f);
+    const ImVec2 half((max.x - min.x) * 0.5f * scale, (max.y - min.y) * 0.5f * scale);
+    scaledMin = ImVec2(center.x - half.x, center.y - half.y);
+    scaledMax = ImVec2(center.x + half.x, center.y + half.y);
+}
+
+void PruneInteractionEffects()
+{
+    const double now = ImGui::GetTime();
+    const float rippleDuration = PanelAnimationDuration(kRippleDuration);
+    for (int i = static_cast<int>(g_Ripples.size()) - 1; i >= 0; --i)
+    {
+        if (now - g_Ripples[static_cast<size_t>(i)].startTime > rippleDuration)
+        {
+            g_Ripples.erase(g_Ripples.begin() + i);
+        }
+    }
+}
+
+void SpawnRipple(ImGuiID itemId, ImVec2 min, ImVec2 max, float radiusScale = 0.72f)
+{
+    if (g_ConfigState.panel.reduceMotion)
+    {
+        return;
+    }
+
+    PruneInteractionEffects();
+    if (g_Ripples.size() >= kMaxActiveRipples)
+    {
+        g_Ripples.erase(g_Ripples.begin());
+    }
+
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    const ImVec2 center(
+        mouse.x < min.x ? min.x : (mouse.x > max.x ? max.x : mouse.x),
+        mouse.y < min.y ? min.y : (mouse.y > max.y ? max.y : mouse.y));
+    const float width = max.x - min.x;
+    const float height = max.y - min.y;
+    const float maxRadius = std::sqrt(width * width + height * height) * radiusScale;
+    g_Ripples.push_back({ itemId, center, ImGui::GetTime(), maxRadius });
+}
+
+void RenderRipplesForItem(ImDrawList* drawList, ImGuiID itemId, ImVec2 min, ImVec2 max)
+{
+    if (g_ConfigState.panel.reduceMotion)
+    {
+        return;
+    }
+
+    const double now = ImGui::GetTime();
+    drawList->PushClipRect(min, max, true);
+    for (const InteractionRipple& ripple : g_Ripples)
+    {
+        if (ripple.itemId != itemId)
+        {
+            continue;
+        }
+
+        const float age = static_cast<float>(now - ripple.startTime);
+        const float t = Clamp01(age / PanelAnimationDuration(kRippleDuration));
+        const float radius = 4.0f + (ripple.maxRadius - 4.0f) * EaseOutCubic(t);
+        const float alpha = (1.0f - t) * 0.28f;
+        drawList->AddCircleFilled(ripple.center, radius, AccentU32(alpha), 48);
+    }
+    drawList->PopClipRect();
+}
+
+void DrawInteractiveGlow(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding, float hoverT, float pressT)
+{
+    const float alpha = hoverT * 0.28f + pressT * 0.12f;
+    if (alpha <= 0.001f)
+    {
+        return;
+    }
+
+    drawList->AddRect(ImVec2(min.x - 1.0f, min.y - 1.0f), ImVec2(max.x + 1.0f, max.y + 1.0f), AccentU32(alpha), rounding + 1.0f, 0, 2.0f);
+    drawList->AddRect(ImVec2(min.x - 3.0f, min.y - 3.0f), ImVec2(max.x + 3.0f, max.y + 3.0f), AccentU32(alpha * 0.38f), rounding + 3.0f, 0, 1.0f);
+}
+
+void UpdateInteractionAnimation(ImGuiID id, bool hovered, bool active, float& hoverT, float& pressT)
+{
+    ImGuiStorage* storage = ImGui::GetStateStorage();
+    float* storedHover = storage->GetFloatRef(id ^ 0x45A531u, 0.0f);
+    float* storedPress = storage->GetFloatRef(id ^ 0x7BC1E3u, 0.0f);
+    *storedHover = Approach(*storedHover, hovered || active ? 1.0f : 0.0f, kAnimFast);
+    *storedPress = Approach(*storedPress, active ? 1.0f : 0.0f, active ? kAnimFast * 0.35f : kAnimFast);
+    hoverT = *storedHover;
+    pressT = *storedPress;
 }
 
 void ShowToast(const char* message, ToastType type, float duration = 2.5f)
@@ -344,7 +608,7 @@ void RenderToastStack(ImVec2 panelMin, ImVec2 panelMax)
     for (int i = static_cast<int>(g_Toasts.size()) - 1; i >= 0; --i)
     {
         const float age = static_cast<float>(now - g_Toasts[static_cast<size_t>(i)].startTime);
-        if (age > g_Toasts[static_cast<size_t>(i)].duration + 0.20f)
+        if (age > g_Toasts[static_cast<size_t>(i)].duration + kAnimMedium)
         {
             g_Toasts.erase(g_Toasts.begin() + i);
         }
@@ -355,13 +619,13 @@ void RenderToastStack(ImVec2 panelMin, ImVec2 panelMax)
     {
         Toast& toast = g_Toasts[static_cast<size_t>(i)];
         const float age = static_cast<float>(now - toast.startTime);
-        const float inT = EaseOutCubic(age / 0.20f);
-        const float outT = age > toast.duration ? Clamp01((age - toast.duration) / 0.20f) : 0.0f;
+        const float inT = EaseOutCubic(age / kAnimMedium);
+        const float outT = age > toast.duration ? EaseInOutCubic((age - toast.duration) / kAnimMedium) : 0.0f;
         const float alpha = Clamp01(inT * (1.0f - outT));
         const float slide = (1.0f - inT + outT) * 34.0f;
         const ImVec2 textSize = ImGui::CalcTextSize(toast.message.c_str());
         const float toastHeight = textSize.y + 24.0f > minToastHeight ? textSize.y + 24.0f : minToastHeight;
-        toast.yOffset = Approach(toast.yOffset, targetY, 0.12f);
+        toast.yOffset = Approach(toast.yOffset, targetY, kAnimFast);
 
         const ImVec2 min(panelMax.x - margin - toastWidth + slide, panelMin.y + toast.yOffset);
         const ImVec2 max(panelMax.x - margin + slide, min.y + toastHeight);
@@ -436,7 +700,7 @@ void DrawAcrylicGrain(ImDrawList* drawList, ImVec2 min, ImVec2 max, float roundi
     };
 
     static std::vector<GrainDot> grain;
-    constexpr int kGrainCount = 440;
+    constexpr int kGrainCount = 560;
     if (grain.empty())
     {
         grain.reserve(kGrainCount);
@@ -448,9 +712,9 @@ void DrawAcrylicGrain(ImDrawList* drawList, ImVec2 min, ImVec2 max, float roundi
             seed = seed * 1664525u + 1013904223u;
             const float y = static_cast<float>((seed >> 8) & 0xFFFFu) / 65535.0f;
             seed = seed * 1664525u + 1013904223u;
-            const float alpha = 0.012f + static_cast<float>((seed >> 12) & 0xFFu) / 255.0f * 0.030f;
+            const float alpha = 0.026f + static_cast<float>((seed >> 12) & 0xFFu) / 255.0f * 0.036f;
             seed = seed * 1664525u + 1013904223u;
-            const float radius = 0.55f + static_cast<float>((seed >> 13) & 0x7Fu) / 127.0f * 0.45f;
+            const float radius = 0.62f + static_cast<float>((seed >> 13) & 0x7Fu) / 127.0f * 0.78f;
             grain.push_back({ x, y, alpha, radius });
         }
     }
@@ -464,6 +728,72 @@ void DrawAcrylicGrain(ImDrawList* drawList, ImVec2 min, ImVec2 max, float roundi
     drawList->PopClipRect();
 }
 
+void DrawGlassBlurDepth(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding, float alphaScale)
+{
+    struct BlurLayer
+    {
+        ImVec2 offset;
+        float grow;
+        float alpha;
+    };
+
+    constexpr BlurLayer layers[] = {
+        { ImVec2(-2.0f, 1.0f), 2.0f, 0.105f },
+        { ImVec2(2.5f, 3.0f), 4.0f, 0.075f },
+        { ImVec2(-1.0f, 5.5f), 7.0f, 0.050f },
+    };
+
+    for (const BlurLayer& layer : layers)
+    {
+        drawList->AddRectFilled(
+            ImVec2(min.x + layer.offset.x - layer.grow, min.y + layer.offset.y - layer.grow),
+            ImVec2(max.x + layer.offset.x + layer.grow, max.y + layer.offset.y + layer.grow),
+            ImGui::GetColorU32(ImVec4(0.018f, 0.018f, 0.026f, layer.alpha * alphaScale)),
+            rounding + layer.grow);
+    }
+}
+
+void DrawGlassEdgeHighlights(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding, float alphaScale)
+{
+    const float width = max.x - min.x;
+    const float height = max.y - min.y;
+    if (width <= 4.0f || height <= 4.0f)
+    {
+        return;
+    }
+
+    drawList->PushClipRect(min, max, true);
+    drawList->AddRectFilledMultiColor(
+        ImVec2(min.x + rounding * 0.45f, min.y + 1.0f),
+        ImVec2(max.x - rounding * 0.45f, min.y + 4.0f),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.255f * alphaScale)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.130f * alphaScale)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.020f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.030f * alphaScale)));
+    drawList->AddRectFilledMultiColor(
+        ImVec2(min.x + 1.0f, min.y + rounding * 0.50f),
+        ImVec2(min.x + 4.0f, max.y - rounding * 0.50f),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.225f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.038f * alphaScale)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.018f * alphaScale)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.118f * alphaScale)));
+    drawList->AddRectFilledMultiColor(
+        ImVec2(min.x + rounding * 0.55f, max.y - 3.0f),
+        ImVec2(max.x - rounding * 0.55f, max.y - 1.0f),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.020f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.105f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.125f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.030f * alphaScale)));
+    drawList->AddRectFilledMultiColor(
+        ImVec2(max.x - 3.0f, min.y + rounding * 0.55f),
+        ImVec2(max.x - 1.0f, max.y - rounding * 0.55f),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.030f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.105f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.125f * alphaScale)),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.020f * alphaScale)));
+    drawList->PopClipRect();
+}
+
 void DrawAcrylicPanelSurface(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding)
 {
     const float width = max.x - min.x;
@@ -473,25 +803,30 @@ void DrawAcrylicPanelSurface(ImDrawList* drawList, ImVec2 min, ImVec2 max, float
         return;
     }
 
+    const float opacity = PanelOpacity();
+    const float glassAlpha = 0.76f * opacity;
+
+    DrawGlassBlurDepth(drawList, min, max, rounding, opacity);
+
     drawList->AddRectFilled(
         min,
         max,
-        ImGui::GetColorU32(ImVec4(0.043f, 0.043f, 0.054f, 1.0f)),
+        ImGui::GetColorU32(ImVec4(0.043f, 0.043f, 0.054f, glassAlpha)),
         rounding);
     drawList->AddRectFilledMultiColor(
         ImVec2(min.x + rounding, min.y + 1.0f),
         ImVec2(max.x - rounding, max.y - 1.0f),
-        ImGui::GetColorU32(ImVec4(0.050f, 0.050f, 0.062f, 0.82f)),
-        ImGui::GetColorU32(ImVec4(0.044f, 0.043f, 0.055f, 0.82f)),
-        ImGui::GetColorU32(ImVec4(0.031f, 0.031f, 0.040f, 0.72f)),
-        ImGui::GetColorU32(ImVec4(0.037f, 0.037f, 0.048f, 0.72f)));
+        ImGui::GetColorU32(ImVec4(0.054f, 0.054f, 0.066f, 0.66f * opacity)),
+        ImGui::GetColorU32(ImVec4(0.046f, 0.045f, 0.058f, 0.62f * opacity)),
+        ImGui::GetColorU32(ImVec4(0.030f, 0.030f, 0.038f, 0.56f * opacity)),
+        ImGui::GetColorU32(ImVec4(0.040f, 0.039f, 0.052f, 0.58f * opacity)));
 
-    const float highlightHeight = height * 0.22f;
+    const float highlightHeight = height * 0.26f;
     drawList->AddRectFilledMultiColor(
         ImVec2(min.x + rounding, min.y + 1.0f),
         ImVec2(max.x - rounding, min.y + highlightHeight),
-        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.115f)),
-        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.055f)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.165f)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.080f)),
         ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)),
         ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)));
     drawList->AddCircleFilled(
@@ -501,11 +836,12 @@ void DrawAcrylicPanelSurface(ImDrawList* drawList, ImVec2 min, ImVec2 max, float
         96);
 
     DrawAcrylicGrain(drawList, min, max, rounding);
+    DrawGlassEdgeHighlights(drawList, min, max, rounding, opacity);
 
     drawList->AddRect(
         ImVec2(min.x + 0.5f, min.y + 0.5f),
         ImVec2(max.x - 0.5f, max.y - 0.5f),
-        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.165f)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.145f)),
         rounding,
         0,
         1.0f);
@@ -523,6 +859,139 @@ void DrawAcrylicPanelSurface(ImDrawList* drawList, ImVec2 min, ImVec2 max, float
         rounding - 2.0f,
         0,
         1.0f);
+}
+
+void AppendBorderPathPoint(std::vector<BorderPathPoint>& path, ImVec2 pos, float& distance)
+{
+    if (!path.empty())
+    {
+        const ImVec2 previous = path.back().pos;
+        const float dx = pos.x - previous.x;
+        const float dy = pos.y - previous.y;
+        distance += std::sqrt(dx * dx + dy * dy);
+    }
+    path.push_back({ pos, distance });
+}
+
+std::vector<BorderPathPoint> BuildRoundedRectSidePath(ImVec2 min, ImVec2 max, float rounding)
+{
+    std::vector<BorderPathPoint> path;
+    path.reserve(72);
+
+    const float width = max.x - min.x;
+    const float height = max.y - min.y;
+    const float radius = rounding < width * 0.5f ? (rounding < height * 0.5f ? rounding : height * 0.5f) : width * 0.5f;
+    float distance = 0.0f;
+    constexpr int kArcSteps = 14;
+
+    auto appendLine = [&](ImVec2 a, ImVec2 b) {
+        if (path.empty())
+        {
+            AppendBorderPathPoint(path, a, distance);
+        }
+        else
+        {
+            AppendBorderPathPoint(path, a, distance);
+        }
+        AppendBorderPathPoint(path, b, distance);
+    };
+
+    auto appendArc = [&](ImVec2 center, float startAngle, float endAngle) {
+        for (int i = 1; i <= kArcSteps; ++i)
+        {
+            const float t = static_cast<float>(i) / static_cast<float>(kArcSteps);
+            const float angle = startAngle + (endAngle - startAngle) * t;
+            AppendBorderPathPoint(path, ImVec2(center.x + std::cos(angle) * radius, center.y + std::sin(angle) * radius), distance);
+        }
+    };
+
+    constexpr float pi = 3.14159265358979323846f;
+
+    appendLine(ImVec2(min.x, min.y + radius), ImVec2(min.x, max.y - radius));
+    appendArc(ImVec2(min.x + radius, max.y - radius), pi, pi * 0.5f);
+    appendLine(ImVec2(min.x + radius, max.y), ImVec2(max.x - radius, max.y));
+    appendArc(ImVec2(max.x - radius, max.y - radius), pi * 0.5f, 0.0f);
+    appendLine(ImVec2(max.x, max.y - radius), ImVec2(max.x, min.y + radius));
+    return path;
+}
+
+void DrawAnimatedBorderTrace(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding, float alphaScale = 1.0f)
+{
+    const float width = max.x - min.x;
+    const float height = max.y - min.y;
+    if (width <= rounding * 2.0f || height <= rounding * 2.0f)
+    {
+        return;
+    }
+
+    const ImVec2 borderMin = min;
+    const ImVec2 borderMax = max;
+    const float borderRounding = rounding;
+    const std::vector<BorderPathPoint> path = BuildRoundedRectSidePath(borderMin, borderMax, borderRounding);
+    if (path.size() < 2)
+    {
+        return;
+    }
+
+    for (size_t i = 1; i < path.size(); ++i)
+    {
+        drawList->AddLine(path[i - 1].pos, path[i].pos, AccentU32(0.16f * alphaScale), 1.25f);
+    }
+
+    const float pathLength = path.back().distance;
+    if (pathLength <= 1.0f)
+    {
+        return;
+    }
+
+    const float loopSeconds = 5.2f;
+    const float traceLength = pathLength * 0.18f;
+    const float halfTrace = traceLength * 0.5f;
+    const double time = ImGui::GetTime();
+    const double distancePerSecond = static_cast<double>(pathLength) / static_cast<double>(loopSeconds);
+    const float head = static_cast<float>(std::fmod(time * distancePerSecond, static_cast<double>(pathLength)));
+
+    auto pathAlpha = [&](float distance) {
+        const float delta = std::fabs(distance - head);
+        if (delta > halfTrace)
+        {
+            return 0.0f;
+        }
+
+        const float edgeFade = traceLength;
+        const float startFade = edgeFade > 0.0f ? Clamp01(head / edgeFade) : 1.0f;
+        const float endFade = edgeFade > 0.0f ? Clamp01((pathLength - head) / edgeFade) : 1.0f;
+        return (1.0f - delta / halfTrace) * startFade * endFade;
+    };
+
+    struct TraceLayer
+    {
+        float thickness;
+        float alpha;
+    };
+    constexpr TraceLayer layers[] = {
+        { 9.0f, 0.070f },
+        { 5.5f, 0.125f },
+        { 2.4f, 0.820f },
+    };
+
+    drawList->PushClipRect(ImVec2(min.x - 14.0f, min.y - 14.0f), ImVec2(max.x + 14.0f, max.y + 14.0f), true);
+    for (const TraceLayer& layer : layers)
+    {
+        for (size_t i = 1; i < path.size(); ++i)
+        {
+            const float midpointDistance = (path[i - 1].distance + path[i].distance) * 0.5f;
+            const float alpha = pathAlpha(midpointDistance);
+            if (alpha <= 0.001f)
+            {
+                continue;
+            }
+
+            const float easedAlpha = EaseOutCubic(alpha) * layer.alpha * alphaScale;
+            drawList->AddLine(path[i - 1].pos, path[i].pos, AccentU32(easedAlpha), layer.thickness);
+        }
+    }
+    drawList->PopClipRect();
 }
 
 ImVec2 DrawLicensedBadge(ImDrawList* drawList, ImVec2 badgeMax)
@@ -646,6 +1115,85 @@ void DrawSectionCardShadow(ImDrawList* drawList, ImVec2 min, ImVec2 max, float r
     }
 }
 
+void DrawSectionHoverLift(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding, float hoverT)
+{
+    if (hoverT <= 0.001f)
+    {
+        return;
+    }
+
+    const float lift = 4.0f * hoverT;
+    const ImVec2 liftedMin(min.x, min.y - lift);
+    const ImVec2 liftedMax(max.x, max.y - lift);
+
+    for (int i = 0; i < 4; ++i)
+    {
+        const float spread = 3.0f + static_cast<float>(i) * (2.6f + hoverT * 1.4f);
+        const float offset = 4.0f + static_cast<float>(i) * 1.7f + hoverT * 4.0f;
+        const float alpha = (0.075f - static_cast<float>(i) * 0.014f) * hoverT;
+        drawList->AddRect(
+            ImVec2(liftedMin.x + offset - spread, liftedMin.y + offset - spread),
+            ImVec2(liftedMax.x + offset + spread, liftedMax.y + offset + spread),
+            ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, alpha)),
+            rounding + spread,
+            0,
+            2.0f + hoverT * 1.5f);
+    }
+
+    drawList->AddRectFilled(
+        liftedMin,
+        liftedMax,
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.022f * hoverT)),
+        rounding);
+    drawList->AddRect(
+        ImVec2(liftedMin.x + 0.5f, liftedMin.y + 0.5f),
+        ImVec2(liftedMax.x - 0.5f, liftedMax.y - 0.5f),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.080f * hoverT)),
+        rounding,
+        0,
+        1.0f + hoverT * 0.4f);
+    drawList->AddRect(
+        ImVec2(liftedMin.x + 2.0f, liftedMin.y + 2.0f),
+        ImVec2(liftedMax.x - 2.0f, liftedMax.y - 2.0f),
+        AccentU32(0.075f * hoverT),
+        rounding - 1.0f,
+        0,
+        1.0f);
+}
+
+void DrawSectionGlassSurface(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding, float hoverT)
+{
+    const float width = max.x - min.x;
+    const float height = max.y - min.y;
+    if (width <= 8.0f || height <= 8.0f)
+    {
+        return;
+    }
+
+    const float opacity = PanelOpacity();
+    const float brighten = 1.0f + hoverT * 0.035f;
+    DrawGlassBlurDepth(drawList, min, max, rounding, 0.45f * opacity);
+    drawList->AddRectFilled(
+        min,
+        max,
+        ImGui::GetColorU32(ScaleColor(kSectionBg, brighten, 0.68f * opacity)),
+        rounding);
+    drawList->AddRectFilledMultiColor(
+        ImVec2(min.x + rounding * 0.65f, min.y + 1.0f),
+        ImVec2(max.x - rounding * 0.65f, min.y + height * 0.28f),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.105f * opacity)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.052f * opacity)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)),
+        ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)));
+    drawList->AddCircleFilled(
+        ImVec2(min.x + width * 0.24f, min.y + height * 0.20f),
+        width * 0.34f,
+        AccentU32(0.018f * opacity),
+        72);
+    DrawAcrylicGrain(drawList, min, max, rounding);
+    DrawGlassEdgeHighlights(drawList, min, max, rounding, 0.72f * opacity);
+}
+
 void DrawInnerGlow(ImDrawList* drawList, ImVec2 min, ImVec2 max, float rounding, float alpha)
 {
     drawList->AddRect(
@@ -700,6 +1248,11 @@ void DrawContentBackgroundDepth(ImDrawList* drawList, ImVec2 min, ImVec2 max)
 
 void DrawAnimatedGradientMesh(ImDrawList* drawList, ImVec2 min, ImVec2 max, float alphaScale)
 {
+    if (g_ConfigState.panel.reduceMotion)
+    {
+        return;
+    }
+
     const float width = max.x - min.x;
     const float height = max.y - min.y;
     const float time = static_cast<float>(ImGui::GetTime());
@@ -765,6 +1318,11 @@ void DrawCircuitTrace(ImDrawList* drawList, const ImVec2* points, int count, ImU
 
 void DrawAnimatedTechPattern(ImDrawList* drawList, ImVec2 min, ImVec2 max, float alphaScale)
 {
+    if (g_ConfigState.panel.reduceMotion)
+    {
+        return;
+    }
+
     const float width = max.x - min.x;
     const float height = max.y - min.y;
     if (width <= 12.0f || height <= 12.0f)
@@ -882,26 +1440,23 @@ void GradientSeparator(float height = 1.0f)
 bool GradientButton(const char* label, ImVec2 size)
 {
     ImGui::PushID(label);
-    const ImGuiID id = ImGui::GetID("##gradient-button-hover");
-    ImGuiStorage* storage = ImGui::GetStateStorage();
-    float* hoverT = storage->GetFloatRef(id, 0.0f);
-    float* pressT = storage->GetFloatRef(ImGui::GetID("##gradient-button-press"), 0.0f);
+    const ImGuiID id = ImGui::GetID("##gradient-button");
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const bool pressed = ImGui::InvisibleButton("##gradient-button", size);
     const bool hovered = ImGui::IsItemHovered();
     const bool active = ImGui::IsItemActive();
-    const float target = hovered || active ? 1.0f : 0.0f;
-    *hoverT = Approach(*hoverT, target, 0.10f);
-    if (pressed)
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
     {
-        *pressT = 1.0f;
+        SpawnRipple(id, pos, ImVec2(pos.x + size.x, pos.y + size.y));
     }
-    *pressT = active ? 1.0f : Approach(*pressT, 0.0f, 0.10f);
+    float hoverT = 0.0f;
+    float pressT = 0.0f;
+    UpdateInteractionAnimation(id, hovered, active, hoverT, pressT);
 
-    const float brighten = 1.0f + (*hoverT * 0.15f) + (active ? 0.08f : 0.0f);
+    const float brighten = 1.0f + (hoverT * 0.18f) + (active ? 0.08f : 0.0f);
     const ImVec4 top = ScaleColor(g_AccentColor, 0.46f * brighten);
     const ImVec4 bottom = ScaleColor(g_AccentColor, 0.26f * brighten);
-    const float drawScale = 1.0f - (*pressT * 0.03f);
+    const float drawScale = 1.0f + hoverT * 0.020f - pressT * 0.050f;
     const ImVec2 center(pos.x + size.x * 0.5f, pos.y + size.y * 0.5f);
     const ImVec2 drawSize(size.x * drawScale, size.y * drawScale);
     const ImVec2 drawPos(center.x - drawSize.x * 0.5f, center.y - drawSize.y * 0.5f);
@@ -917,16 +1472,94 @@ bool GradientButton(const char* label, ImVec2 size)
         ImGui::GetColorU32(bottom),
         ImGui::GetColorU32(bottom));
     drawList->AddRect(drawPos, max, ImGui::GetColorU32(GetAccentHoverColor()), kButtonRounding, 0, 1.0f);
-    if (hovered || active)
-    {
-        drawList->AddRect(ImVec2(drawPos.x - 1.0f, drawPos.y - 1.0f), ImVec2(max.x + 1.0f, max.y + 1.0f), AccentU32(0.24f), kButtonRounding + 1.0f, 0, 2.0f);
-    }
+    DrawInteractiveGlow(drawList, drawPos, max, kButtonRounding, hoverT, pressT);
+    RenderRipplesForItem(drawList, id, drawPos, max);
 
     const ImVec2 textSize = ImGui::CalcTextSize(label);
     drawList->AddText(
         ImVec2(drawPos.x + (drawSize.x - textSize.x) * 0.5f, drawPos.y + (drawSize.y - textSize.y) * 0.5f),
         ImGui::GetColorU32(ImVec4(0.940f, 0.930f, 0.970f, 1.0f)),
         label);
+
+    ImGui::PopID();
+    return pressed;
+}
+
+bool ContinueToPanelButton(ImVec2 size)
+{
+    const char* label = "Continue to Panel";
+    ImGui::PushID("ContinueToPanelButton");
+    const ImGuiID id = ImGui::GetID("##continue-button");
+    const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const bool pressed = ImGui::InvisibleButton("##continue-button", size);
+    const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+    {
+        SpawnRipple(id, pos, ImVec2(pos.x + size.x, pos.y + size.y));
+    }
+
+    float hoverT = 0.0f;
+    float pressT = 0.0f;
+    UpdateInteractionAnimation(id, hovered, active, hoverT, pressT);
+
+    constexpr float pi = 3.14159265358979323846f;
+    const float time = static_cast<float>(ImGui::GetTime());
+    const float wave = 0.5f + 0.5f * std::sin((time / 1.75f) * pi * 2.0f);
+    const float pulse = EaseInOutCubic(wave);
+    const float breatheScale = 1.0f + pulse * 0.030f;
+    const float drawScale = breatheScale + hoverT * 0.018f - pressT * 0.050f;
+    const ImVec2 center(pos.x + size.x * 0.5f, pos.y + size.y * 0.5f);
+    const ImVec2 drawSize(size.x * drawScale, size.y * drawScale);
+    const ImVec2 drawPos(center.x - drawSize.x * 0.5f, center.y - drawSize.y * 0.5f);
+    const ImVec2 max(drawPos.x + drawSize.x, drawPos.y + drawSize.y);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+
+    const float glowAlpha = 0.095f + pulse * 0.085f + hoverT * 0.145f;
+    for (int i = 0; i < 3; ++i)
+    {
+        const float spread = 4.0f + static_cast<float>(i) * 4.0f + pulse * 5.0f + hoverT * 3.5f;
+        const float alpha = glowAlpha * (0.52f - static_cast<float>(i) * 0.13f);
+        drawList->AddRectFilled(
+            ImVec2(drawPos.x - spread, drawPos.y - spread),
+            ImVec2(max.x + spread, max.y + spread),
+            AccentU32(alpha),
+            kButtonRounding + spread);
+    }
+
+    const float brighten = 1.08f + (pulse * 0.08f) + (hoverT * 0.20f) + (active ? 0.08f : 0.0f);
+    const ImVec4 top = ScaleColor(g_AccentColor, 0.52f * brighten);
+    const ImVec4 bottom = ScaleColor(g_AccentColor, 0.29f * brighten);
+    drawList->AddRectFilled(drawPos, max, ImGui::GetColorU32(bottom), kButtonRounding);
+    drawList->AddRectFilledMultiColor(
+        ImVec2(drawPos.x + kButtonRounding * 0.55f, drawPos.y),
+        ImVec2(max.x - kButtonRounding * 0.55f, max.y),
+        ImGui::GetColorU32(top),
+        ImGui::GetColorU32(top),
+        ImGui::GetColorU32(bottom),
+        ImGui::GetColorU32(bottom));
+    drawList->AddRect(drawPos, max, ImGui::GetColorU32(GetAccentHoverColor()), kButtonRounding, 0, 1.15f);
+    drawList->AddRect(ImVec2(drawPos.x + 2.0f, drawPos.y + 2.0f), ImVec2(max.x - 2.0f, max.y - 2.0f), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.10f + pulse * 0.035f)), kButtonRounding - 2.0f, 0, 1.0f);
+    DrawInteractiveGlow(drawList, drawPos, max, kButtonRounding, hoverT + pulse * 0.32f, pressT);
+    RenderRipplesForItem(drawList, id, drawPos, max);
+
+    const ImVec2 textSize = ImGui::CalcTextSize(label);
+    const float textShift = hoverT * -6.0f;
+    const ImVec2 textPos(drawPos.x + (drawSize.x - textSize.x) * 0.5f + textShift, drawPos.y + (drawSize.y - textSize.y) * 0.5f);
+    drawList->AddText(textPos, ImGui::GetColorU32(ImVec4(0.960f, 0.950f, 0.990f, 1.0f)), label);
+
+    if (hoverT > 0.001f)
+    {
+        const float arrowRaw = time * 1.35f;
+        const float arrowLoop = arrowRaw - std::floor(arrowRaw);
+        const float arrowT = EaseOutCubic(arrowLoop);
+        const float arrowAlpha = hoverT * (1.0f - arrowLoop) * 0.82f;
+        const float arrowX = textPos.x + textSize.x + 10.0f + arrowT * 8.0f;
+        const float arrowY = drawPos.y + drawSize.y * 0.5f;
+        const ImU32 arrowColor = ImGui::GetColorU32(ImVec4(0.96f, 0.98f, 1.0f, arrowAlpha));
+        drawList->AddLine(ImVec2(arrowX, arrowY - 4.0f), ImVec2(arrowX + 5.0f, arrowY), arrowColor, 1.8f);
+        drawList->AddLine(ImVec2(arrowX, arrowY + 4.0f), ImVec2(arrowX + 5.0f, arrowY), arrowColor, 1.8f);
+    }
 
     ImGui::PopID();
     return pressed;
@@ -943,6 +1576,31 @@ void Tooltip(const char* text)
 void ToggleRow(const char* label, bool* value, const char* tooltip)
 {
     ToggleSwitch(label, value);
+    const ImGuiID itemId = ImGui::GetItemID();
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+    {
+        SpawnRipple(itemId, min, max, 0.56f);
+    }
+    RenderRipplesForItem(ImGui::GetWindowDrawList(), itemId, min, max);
+    Tooltip(tooltip);
+}
+
+void AutoSaveToggleRow(const char* label, bool* value, const char* tooltip)
+{
+    if (ToggleSwitch(label, value))
+    {
+        RequestAutoConfigSave();
+    }
+    const ImGuiID itemId = ImGui::GetItemID();
+    const ImVec2 min = ImGui::GetItemRectMin();
+    const ImVec2 max = ImGui::GetItemRectMax();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+    {
+        SpawnRipple(itemId, min, max, 0.56f);
+    }
+    RenderRipplesForItem(ImGui::GetWindowDrawList(), itemId, min, max);
     Tooltip(tooltip);
 }
 
@@ -983,11 +1641,12 @@ void PushRowWidgetStyle()
     ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.150f, 0.105f, 0.240f, 1.0f));
     ImGui::PushStyleColor(ImGuiCol_Border, kSectionBorder);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
+    ImGui::PushStyleVar(ImGuiStyleVar_GrabMinSize, 14.0f);
 }
 
 void PopRowWidgetStyle()
 {
-    ImGui::PopStyleVar();
+    ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(4);
 }
 
@@ -996,10 +1655,26 @@ void SliderFloatRow(const char* label, float* value, float minValue, float maxVa
     ImGui::PushID(label);
     BeginRightAlignedWidgetRow(label, kRowWidgetWidth);
     PushRowWidgetStyle();
-    ImGui::SliderFloat("##slider", value, minValue, maxValue, format);
+    ImGui::SliderFloat("##slider", value, minValue, maxValue, format, ImGuiSliderFlags_NoRoundToFormat);
     PopRowWidgetStyle();
     Tooltip(tooltip);
     ImGui::PopID();
+}
+
+bool AutoSaveSliderFloatRow(const char* label, float* value, float minValue, float maxValue, const char* format, const char* tooltip)
+{
+    ImGui::PushID(label);
+    BeginRightAlignedWidgetRow(label, kRowWidgetWidth);
+    PushRowWidgetStyle();
+    const bool changed = ImGui::SliderFloat("##slider", value, minValue, maxValue, format, ImGuiSliderFlags_NoRoundToFormat);
+    PopRowWidgetStyle();
+    if (changed)
+    {
+        RequestAutoConfigSave();
+    }
+    Tooltip(tooltip);
+    ImGui::PopID();
+    return changed;
 }
 
 void ColorRow(const char* label, float color[4], const char* tooltip)
@@ -1039,7 +1714,7 @@ void KeybindDisplay(const char* label, const char* keyName, const char* tooltip)
 {
     ImGui::TextUnformatted(label);
     ImGui::SameLine(170.0f);
-    ImGui::Button(keyName, ImVec2(96.0f, 0.0f));
+    GradientButton(keyName, ImVec2(96.0f, ImGui::GetFrameHeight()));
     Tooltip(tooltip);
 }
 
@@ -1051,8 +1726,8 @@ void HotkeySelectorRow()
     ImGui::SameLine(170.0f);
 
     const char* buttonText = g_IsCapturingToggleHotkey ? "Press any key..." : GetToggleHotkeyName();
-    const ImVec2 buttonSize(132.0f, 0.0f);
-    if (ImGui::Button(buttonText, buttonSize))
+    const ImVec2 buttonSize(132.0f, ImGui::GetFrameHeight());
+    if (GradientButton(buttonText, buttonSize))
     {
         g_IsCapturingToggleHotkey = true;
         captureStartTime = ImGui::GetTime();
@@ -1083,7 +1758,7 @@ void HotkeySelectorRow()
             0,
             1.6f);
 
-        if (ImGui::GetTime() - captureStartTime > 0.10)
+    if (ImGui::GetTime() - captureStartTime > kAnimFast)
         {
             for (const KeyOption& key : kCaptureKeys)
             {
@@ -1091,6 +1766,7 @@ void HotkeySelectorRow()
                 {
                     g_ToggleHotkey = key.vk;
                     g_IsCapturingToggleHotkey = false;
+                    RequestAutoConfigSave();
                     std::string message = "Hotkey updated to ";
                     message += key.name;
                     ShowToast(message.c_str(), ToastType::Info);
@@ -1105,11 +1781,20 @@ void HotkeySelectorRow()
 
 void SectionBegin(const char* title)
 {
+    const ImGuiID sectionId = ImGui::GetID(title);
+    SectionHoverState& hoverState = GetSectionHoverState(sectionId);
+    g_SectionStack.push_back({ sectionId });
     const ImVec2 sectionShadowMin = ImGui::GetCursorScreenPos();
     const ImVec2 sectionShadowMax(sectionShadowMin.x + ImGui::GetContentRegionAvail().x, sectionShadowMin.y + 96.0f);
-    DrawSectionCardShadow(ImGui::GetWindowDrawList(), sectionShadowMin, sectionShadowMax, kSectionRounding);
+    const ImVec2 visualMin = hoverState.hasBounds ? hoverState.min : sectionShadowMin;
+    const ImVec2 visualMax = hoverState.hasBounds ? hoverState.max : sectionShadowMax;
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    DrawSectionCardShadow(drawList, visualMin, visualMax, kSectionRounding);
+    DrawSectionGlassSurface(drawList, visualMin, visualMax, kSectionRounding, hoverState.progress);
+    DrawSectionHoverLift(drawList, visualMin, visualMax, kSectionRounding, hoverState.progress);
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, WithAlpha(kSectionBg, 0.90f));
+    const float bgBrighten = 1.0f + hoverState.progress * 0.045f;
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ScaleColor(kSectionBg, bgBrighten, 0.68f * PanelOpacity()));
     ImGui::PushStyleColor(ImGuiCol_Border, kSectionBorder);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, kSectionRounding);
     ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, 1.0f);
@@ -1117,14 +1802,14 @@ void SectionBegin(const char* title)
     const ImVec2 headerPos = ImGui::GetCursorScreenPos();
     const float headerWidth = ImGui::GetContentRegionAvail().x;
     constexpr float headerHeight = 27.0f;
-    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    drawList = ImGui::GetWindowDrawList();
     drawList->AddRectFilledMultiColor(
         headerPos,
         ImVec2(headerPos.x + headerWidth, headerPos.y + headerHeight),
-        AccentU32(0.26f),
-        AccentU32(0.02f),
+        AccentU32(0.32f),
+        AccentU32(0.04f),
         AccentU32(0.00f),
-        AccentU32(0.16f));
+        AccentU32(0.20f));
     const ImVec2 titlePos(headerPos.x + 8.0f, headerPos.y + 5.0f);
     if (g_FontSection != nullptr)
     {
@@ -1143,9 +1828,22 @@ void SectionEnd()
     ImGui::EndChild();
     const ImVec2 min = ImGui::GetItemRectMin();
     const ImVec2 max = ImGui::GetItemRectMax();
+    ImGuiID sectionId = ImGui::GetItemID();
+    if (!g_SectionStack.empty())
+    {
+        sectionId = g_SectionStack.back().id;
+        g_SectionStack.pop_back();
+    }
+    const bool hovered = ImGui::IsMouseHoveringRect(min, max, true);
+    SectionHoverState& hoverState = GetSectionHoverState(sectionId);
+    hoverState.min = min;
+    hoverState.max = max;
+    hoverState.hasBounds = true;
+    hoverState.progress = ExponentialSmooth(hoverState.progress, hovered ? 1.0f : 0.0f, kSectionLiftDuration);
     DrawSectionLift(ImGui::GetWindowDrawList(), min, max, kSectionRounding);
     ImDrawList* drawList = ImGui::GetWindowDrawList();
-    drawList->AddRect(ImVec2(min.x + 0.5f, min.y + 0.5f), ImVec2(max.x - 0.5f, max.y - 0.5f), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.095f)), kSectionRounding, 0, 1.0f);
+    DrawGlassEdgeHighlights(drawList, min, max, kSectionRounding, 0.76f * PanelOpacity());
+    drawList->AddRect(ImVec2(min.x + 0.5f, min.y + 0.5f), ImVec2(max.x - 0.5f, max.y - 0.5f), ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.125f)), kSectionRounding, 0, 1.0f);
     drawList->AddRect(ImVec2(min.x + 2.0f, min.y + 2.0f), ImVec2(max.x - 2.0f, max.y - 2.0f), AccentU32(0.055f), kSectionRounding - 1.0f, 0, 1.0f);
     ImGui::PopStyleVar(2);
     ImGui::PopStyleColor(2);
@@ -1216,6 +1914,13 @@ void DrawSidebarIcon(ImDrawList* drawList, Category category, ImVec2 center, ImU
             drawList->AddLine(inner, outer, color, 1.45f);
         }
         break;
+    case Category::Settings:
+        drawList->AddRect(ImVec2(center.x - 7.8f, center.y - 7.8f), ImVec2(center.x + 7.8f, center.y + 7.8f), color, 3.0f, 0, stroke);
+        drawList->AddLine(ImVec2(center.x - 4.8f, center.y - 2.8f), ImVec2(center.x + 4.8f, center.y - 2.8f), color, 1.3f);
+        drawList->AddCircleFilled(ImVec2(center.x - 1.8f, center.y - 2.8f), 1.8f, color, 14);
+        drawList->AddLine(ImVec2(center.x - 4.8f, center.y + 3.2f), ImVec2(center.x + 4.8f, center.y + 3.2f), color, 1.3f);
+        drawList->AddCircleFilled(ImVec2(center.x + 2.0f, center.y + 3.2f), 1.8f, color, 14);
+        break;
     default:
         drawList->AddCircleFilled(center, 4.0f, color, 16);
         break;
@@ -1229,6 +1934,7 @@ void SidebarButton(const CategoryItem& item, Category* selected, ImVec2* selecte
 
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const ImVec2 rowSize(ImGui::GetContentRegionAvail().x, 38.0f);
+    const ImGuiID itemId = ImGui::GetID("##sidebar-row");
     if (ImGui::InvisibleButton("##sidebar-row", rowSize))
     {
         *selected = item.id;
@@ -1236,9 +1942,17 @@ void SidebarButton(const CategoryItem& item, Category* selected, ImVec2* selecte
 
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+    {
+        SpawnRipple(itemId, pos, ImVec2(pos.x + rowSize.x, pos.y + rowSize.y), 0.58f);
+    }
     ImGuiStorage* storage = ImGui::GetStateStorage();
     float* hoverT = storage->GetFloatRef(ImGui::GetID("##sidebar-hover"), 0.0f);
-    *hoverT = Approach(*hoverT, hovered && !isSelected ? 1.0f : 0.0f, 0.10f);
+    *hoverT = Approach(*hoverT, hovered && !isSelected ? 1.0f : 0.0f, kAnimFast);
+    float interactionHover = 0.0f;
+    float interactionPress = 0.0f;
+    UpdateInteractionAnimation(itemId, hovered, active, interactionHover, interactionPress);
     const ImVec4 unselectedText = kMutedText;
     const ImVec4 hoveredText = ImVec4(0.780f, 0.760f, 0.840f, 1.0f);
     const ImVec4 textMix(
@@ -1256,6 +1970,10 @@ void SidebarButton(const CategoryItem& item, Category* selected, ImVec2* selecte
     const ImU32 textColor = ImGui::GetColorU32(isSelected ? g_AccentColor : textMix);
     const ImU32 iconColor = ImGui::GetColorU32(isSelected ? g_AccentColor : iconMix);
     const ImVec2 rowMax(pos.x + rowSize.x, pos.y + rowSize.y);
+    const float rowScale = 1.0f + interactionHover * 0.018f - interactionPress * 0.035f;
+    ImVec2 drawMin;
+    ImVec2 drawMax;
+    ScaleRectAroundCenter(pos, rowMax, rowScale, drawMin, drawMax);
 
     if (isSelected)
     {
@@ -1269,21 +1987,23 @@ void SidebarButton(const CategoryItem& item, Category* selected, ImVec2* selecte
         {
             const float spread = static_cast<float>(i + 1) * 2.0f;
             drawList->AddRectFilled(
-                ImVec2(pos.x - spread, pos.y - spread),
-                ImVec2(rowMax.x + spread, rowMax.y + spread),
+                ImVec2(drawMin.x - spread, drawMin.y - spread),
+                ImVec2(drawMax.x + spread, drawMax.y + spread),
                 AccentU32(0.080f - static_cast<float>(i) * 0.018f),
                 8.0f + spread);
         }
-        drawList->AddRectFilled(pos, rowMax, ImGui::GetColorU32(ScaleColor(g_AccentColor, 0.24f)), 7.0f);
-        DrawInnerGlow(drawList, pos, rowMax, 7.0f, 0.30f);
+        drawList->AddRectFilled(drawMin, drawMax, ImGui::GetColorU32(ScaleColor(g_AccentColor, 0.24f)), 7.0f);
+        DrawInnerGlow(drawList, drawMin, drawMax, 7.0f, 0.30f);
     }
     else if (*hoverT > 0.001f)
     {
-        drawList->AddRectFilled(pos, rowMax, ImGui::GetColorU32(ImVec4(0.105f, 0.105f, 0.125f, 0.70f * *hoverT)), 7.0f);
+        drawList->AddRectFilled(drawMin, drawMax, ImGui::GetColorU32(ImVec4(0.105f, 0.105f, 0.125f, 0.70f * *hoverT)), 7.0f);
     }
+    DrawInteractiveGlow(drawList, drawMin, drawMax, 7.0f, interactionHover, interactionPress);
+    RenderRipplesForItem(drawList, itemId, drawMin, drawMax);
 
-    DrawSidebarIcon(drawList, item.id, ImVec2(pos.x + 18.0f, pos.y + rowSize.y * 0.5f), iconColor);
-    drawList->AddText(ImVec2(pos.x + 38.0f, pos.y + (rowSize.y - ImGui::GetTextLineHeight()) * 0.5f), textColor, item.label);
+    DrawSidebarIcon(drawList, item.id, ImVec2(drawMin.x + 18.0f * rowScale, drawMin.y + (drawMax.y - drawMin.y) * 0.5f), iconColor);
+    drawList->AddText(ImVec2(drawMin.x + 38.0f * rowScale, drawMin.y + ((drawMax.y - drawMin.y) - ImGui::GetTextLineHeight()) * 0.5f), textColor, item.label);
 
     ImGui::PopID();
 }
@@ -1300,68 +2020,229 @@ const char* CategoryTitle(Category category)
     case Category::Player: return "Player";
     case Category::Misc: return "Misc";
     case Category::Config: return "Config";
+    case Category::Settings: return "Settings";
     default: return "Settings";
     }
 }
 
+float Fract(float value)
+{
+    return value - std::floor(value);
+}
+
+float Noise01(float seed)
+{
+    return Fract(std::sin(seed * 12.9898f + 78.233f) * 43758.5453f);
+}
+
+BrandGlitchSample GetBrandGlitchSample()
+{
+    static double nextBurstTime = 0.0;
+    static double burstStartTime = -10.0;
+    static float burstDuration = 0.20f;
+    static float burstSeed = 0.0f;
+
+    const double now = ImGui::GetTime();
+    if (nextBurstTime <= 0.0)
+    {
+        nextBurstTime = now + 2.4;
+    }
+
+    if (now >= nextBurstTime && now > burstStartTime + static_cast<double>(burstDuration))
+    {
+        burstSeed = static_cast<float>(now * 31.713);
+        burstDuration = 0.15f + Noise01(burstSeed + 1.7f) * 0.10f;
+        burstStartTime = now;
+        nextBurstTime = now + 4.0 + static_cast<double>(Noise01(burstSeed + 4.9f) * 2.0f);
+    }
+
+    const float age = static_cast<float>(now - burstStartTime);
+    if (age < 0.0f || age > burstDuration)
+    {
+        return { false, 0.0f, 0.0f, burstSeed };
+    }
+
+    const float progress = Clamp01(age / burstDuration);
+    const float intensity = std::sin(progress * 3.14159265f);
+    return { true, progress, intensity, burstSeed };
+}
+
+void AddBrandText(ImDrawList* drawList, ImFont* font, float fontSize, ImVec2 pos, ImU32 color, const char* text)
+{
+    if (font != nullptr)
+    {
+        drawList->AddText(font, fontSize, pos, color, text);
+    }
+    else
+    {
+        drawList->AddText(pos, color, text);
+    }
+}
+
+ImVec2 CalcBrandTextSize(ImFont* font, float fontSize, const char* text)
+{
+    if (font != nullptr)
+    {
+        return font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, text);
+    }
+    return ImGui::CalcTextSize(text);
+}
+
+void DrawGlitchBrandText(ImDrawList* drawList, ImFont* font, float fontSize, ImVec2 pos, const char* text, BrandGlitchSample glitch, float alpha = 1.0f)
+{
+    const ImU32 baseColor = ImGui::GetColorU32(WithAlpha(g_AccentColor, alpha));
+    if (!glitch.active)
+    {
+        AddBrandText(drawList, font, fontSize, pos, baseColor, text);
+        return;
+    }
+
+    const ImVec2 textSize = CalcBrandTextSize(font, fontSize, text);
+    const float split = 1.0f + glitch.intensity * 2.2f;
+    AddBrandText(drawList, font, fontSize, ImVec2(pos.x + split, pos.y), ImGui::GetColorU32(ImVec4(1.0f, 0.12f, 0.18f, 0.48f * glitch.intensity * alpha)), text);
+    AddBrandText(drawList, font, fontSize, ImVec2(pos.x - split * 0.9f, pos.y + 0.5f), ImGui::GetColorU32(ImVec4(0.12f, 0.90f, 1.0f, 0.50f * glitch.intensity * alpha)), text);
+    AddBrandText(drawList, font, fontSize, pos, baseColor, text);
+
+    for (int i = 0; i < 2; ++i)
+    {
+        const float sliceNoise = Noise01(glitch.seed + static_cast<float>(i) * 5.37f + glitch.progress * 9.0f);
+        const float bandY = pos.y + 2.0f + sliceNoise * (textSize.y > 6.0f ? textSize.y - 6.0f : 1.0f);
+        const float bandHeight = 1.6f + Noise01(glitch.seed + static_cast<float>(i) * 8.11f) * 1.8f;
+        const float bandShift = (i == 0 ? 3.0f : -2.2f) * glitch.intensity;
+        drawList->PushClipRect(ImVec2(pos.x - 5.0f, bandY), ImVec2(pos.x + textSize.x + 8.0f, bandY + bandHeight), true);
+        AddBrandText(
+            drawList,
+            font,
+            fontSize,
+            ImVec2(pos.x + bandShift, pos.y),
+            i == 0
+                ? ImGui::GetColorU32(ImVec4(0.16f, 0.96f, 1.0f, 0.78f * alpha))
+                : ImGui::GetColorU32(ImVec4(1.0f, 0.18f, 0.22f, 0.64f * alpha)),
+            text);
+        drawList->PopClipRect();
+        drawList->AddLine(
+            ImVec2(pos.x - 4.0f, bandY + bandHeight * 0.5f),
+            ImVec2(pos.x + textSize.x + 4.0f, bandY + bandHeight * 0.5f),
+            ImGui::GetColorU32(ImVec4(0.72f, 0.98f, 1.0f, 0.20f * glitch.intensity * alpha)),
+            1.0f);
+    }
+}
+
+void DrawLogoTrace(ImDrawList* drawList, ImVec2 a, ImVec2 b, ImVec2 c, ImU32 lineColor, ImU32 dotColor, float stroke)
+{
+    drawList->AddLine(a, b, lineColor, stroke);
+    drawList->AddLine(b, c, lineColor, stroke);
+    drawList->AddCircleFilled(c, stroke * 1.45f, dotColor, 12);
+}
+
+void DrawEzMonogramLayer(ImDrawList* drawList, ImVec2 topLeft, float size, ImVec2 offset, ImU32 color, ImU32 softColor, float alphaScale)
+{
+    const ImVec2 center(topLeft.x + size * 0.5f, topLeft.y + size * 0.5f);
+    constexpr float pi = 3.14159265358979323846f;
+    ImVec2 hex[6];
+    const float radius = size * 0.43f;
+    for (int i = 0; i < 6; ++i)
+    {
+        const float angle = -pi * 0.5f + static_cast<float>(i) * (pi / 3.0f);
+        hex[i] = ImVec2(center.x + std::cos(angle) * radius + offset.x, center.y + std::sin(angle) * radius + offset.y);
+    }
+
+    const float stroke = size * 0.065f;
+    drawList->AddPolyline(hex, 6, color, ImDrawFlags_Closed, stroke);
+    drawList->AddPolyline(hex, 6, softColor, ImDrawFlags_Closed, 1.0f);
+
+    const ImU32 traceColor = ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.48f * alphaScale));
+    const ImU32 dotColor = ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.82f * alphaScale));
+    DrawLogoTrace(drawList, hex[1], ImVec2(hex[1].x + size * 0.11f, hex[1].y), ImVec2(hex[1].x + size * 0.11f, hex[1].y - size * 0.12f), traceColor, dotColor, 1.1f);
+    DrawLogoTrace(drawList, hex[2], ImVec2(hex[2].x + size * 0.10f, hex[2].y), ImVec2(hex[2].x + size * 0.16f, hex[2].y + size * 0.07f), traceColor, dotColor, 1.1f);
+    DrawLogoTrace(drawList, hex[5], ImVec2(hex[5].x - size * 0.10f, hex[5].y), ImVec2(hex[5].x - size * 0.15f, hex[5].y + size * 0.08f), traceColor, dotColor, 1.1f);
+
+    const float left = topLeft.x + size * 0.24f + offset.x;
+    const float split = topLeft.x + size * 0.48f + offset.x;
+    const float right = topLeft.x + size * 0.76f + offset.x;
+    const float top = topLeft.y + size * 0.29f + offset.y;
+    const float mid = topLeft.y + size * 0.50f + offset.y;
+    const float bottom = topLeft.y + size * 0.71f + offset.y;
+    const float letterStroke = size * 0.070f;
+
+    drawList->AddLine(ImVec2(left, top), ImVec2(left, bottom), color, letterStroke);
+    drawList->AddLine(ImVec2(left, top), ImVec2(split, top), softColor, letterStroke);
+    drawList->AddLine(ImVec2(left, mid), ImVec2(split - size * 0.035f, mid), color, letterStroke);
+    drawList->AddLine(ImVec2(left, bottom), ImVec2(split, bottom), softColor, letterStroke);
+
+    drawList->AddLine(ImVec2(split, top), ImVec2(right, top), softColor, letterStroke);
+    drawList->AddLine(ImVec2(right, top), ImVec2(split, bottom), color, letterStroke);
+    drawList->AddLine(ImVec2(split, bottom), ImVec2(right, bottom), softColor, letterStroke);
+}
+
 void RenderEzMonogram(ImDrawList* drawList, ImVec2 topLeft, float size)
 {
+    const BrandGlitchSample glitch = GetBrandGlitchSample();
     const float pulse = 0.5f + 0.5f * sinf(static_cast<float>(ImGui::GetTime()) * 2.4f);
     const ImVec2 center(topLeft.x + size * 0.5f, topLeft.y + size * 0.5f);
-    const ImVec4 accentHover = GetAccentHoverColor();
-    const ImU32 accent = ImGui::GetColorU32(g_AccentColor);
-    const ImU32 accentSoft = ImGui::GetColorU32(accentHover);
-    const ImU32 glow = ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.12f + pulse * 0.16f));
-    const ImU32 outline = ImGui::GetColorU32(ImVec4(0.165f, 0.130f, 0.230f, 1.0f));
-    const float stroke = 3.1f;
+    drawList->AddCircleFilled(center, size * (0.56f + pulse * 0.04f), ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.060f + pulse * 0.055f)), 48);
 
-    drawList->AddCircleFilled(center, size * (0.55f + pulse * 0.05f), glow, 48);
-    drawList->AddCircleFilled(center, size * (0.72f + pulse * 0.07f), ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.035f + pulse * 0.035f)), 48);
-    drawList->AddCircle(center, size * 0.49f, ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.32f + pulse * 0.26f)), 48, 1.5f);
-    drawList->AddCircle(center, size * 0.40f, outline, 48, 1.0f);
+    if (glitch.active)
+    {
+        const float split = 1.0f + glitch.intensity * 2.2f;
+        DrawEzMonogramLayer(
+            drawList,
+            topLeft,
+            size,
+            ImVec2(split, 0.0f),
+            ImGui::GetColorU32(ImVec4(1.0f, 0.12f, 0.18f, 0.40f * glitch.intensity)),
+            ImGui::GetColorU32(ImVec4(1.0f, 0.26f, 0.30f, 0.34f * glitch.intensity)),
+            glitch.intensity);
+        DrawEzMonogramLayer(
+            drawList,
+            topLeft,
+            size,
+            ImVec2(-split * 0.85f, 0.6f),
+            ImGui::GetColorU32(ImVec4(0.10f, 0.88f, 1.0f, 0.44f * glitch.intensity)),
+            ImGui::GetColorU32(ImVec4(0.20f, 0.96f, 1.0f, 0.36f * glitch.intensity)),
+            glitch.intensity);
+    }
 
-    const float left = topLeft.x + 7.0f;
-    const float right = topLeft.x + size - 6.0f;
-    const float top = topLeft.y + 7.0f;
-    const float mid = topLeft.y + size * 0.50f;
-    const float bottom = topLeft.y + size - 7.0f;
-    const float zLeft = topLeft.x + size * 0.45f;
+    DrawEzMonogramLayer(
+        drawList,
+        topLeft,
+        size,
+        ImVec2(0.0f, 0.0f),
+        ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.92f)),
+        ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.82f)),
+        1.0f);
 
-    drawList->AddLine(ImVec2(left, top), ImVec2(left, bottom), accent, stroke);
-    drawList->AddLine(ImVec2(left, top), ImVec2(zLeft, top), accentSoft, stroke);
-    drawList->AddLine(ImVec2(left, mid), ImVec2(zLeft - 1.0f, mid), accent, stroke);
-    drawList->AddLine(ImVec2(left, bottom), ImVec2(zLeft, bottom), accentSoft, stroke);
-
-    drawList->AddLine(ImVec2(zLeft, top), ImVec2(right, top), accentSoft, stroke);
-    drawList->AddLine(ImVec2(right, top), ImVec2(zLeft, bottom), accent, stroke);
-    drawList->AddLine(ImVec2(zLeft, bottom), ImVec2(right, bottom), accentSoft, stroke);
-    drawList->AddBezierCubic(
-        ImVec2(zLeft - 1.0f, bottom + 1.0f),
-        ImVec2(topLeft.x + size * 0.57f, topLeft.y + size * 0.82f),
-        ImVec2(topLeft.x + size * 0.73f, topLeft.y + size * 0.62f),
-        ImVec2(right - 1.0f, top + 1.0f),
-        ImGui::GetColorU32(WithAlpha(g_AccentColor, 0.28f)),
-        1.2f);
+    if (glitch.active)
+    {
+        for (int i = 0; i < 2; ++i)
+        {
+            const float bandY = topLeft.y + size * (0.24f + Noise01(glitch.seed + static_cast<float>(i) * 4.1f + glitch.progress * 7.0f) * 0.48f);
+            const float bandShift = (i == 0 ? 3.0f : -2.4f) * glitch.intensity;
+            drawList->PushClipRect(ImVec2(topLeft.x - 4.0f, bandY), ImVec2(topLeft.x + size + 8.0f, bandY + 2.0f), true);
+            DrawEzMonogramLayer(drawList, topLeft, size, ImVec2(bandShift, 0.0f), AccentU32(0.78f), ImGui::GetColorU32(WithAlpha(GetAccentHoverColor(), 0.72f)), glitch.intensity);
+            drawList->PopClipRect();
+        }
+    }
 }
 
 void RenderBrandHeader()
 {
     const ImVec2 cursor = ImGui::GetCursorScreenPos();
-    const ImVec2 logoPos(cursor.x + 2.0f, cursor.y + 2.0f);
-    RenderEzMonogram(ImGui::GetWindowDrawList(), logoPos, 32.0f);
+    ImDrawList* drawList = ImGui::GetWindowDrawList();
+    const BrandGlitchSample glitch = GetBrandGlitchSample();
+    const ImVec2 logoPos(cursor.x + 2.0f, cursor.y + 1.0f);
+    RenderEzMonogram(drawList, logoPos, 34.0f);
 
-    ImGui::Dummy(ImVec2(36.0f, 36.0f));
+    ImGui::Dummy(ImVec2(40.0f, 38.0f));
     ImGui::SameLine();
     ImGui::BeginGroup();
-    if (g_FontSection != nullptr)
-    {
-        ImGui::PushFont(g_FontSection);
-    }
-    ImGui::TextColored(g_AccentColor, "EazyE HEX");
-    if (g_FontSection != nullptr)
-    {
-        ImGui::PopFont();
-    }
+    const char* title = "EazyE HEX";
+    ImFont* titleFont = g_FontSection;
+    const float titleFontSize = titleFont != nullptr ? titleFont->LegacySize : ImGui::GetFontSize();
+    const ImVec2 titlePos = ImGui::GetCursorScreenPos();
+    DrawGlitchBrandText(drawList, titleFont, titleFontSize, titlePos, title, glitch);
+    const ImVec2 titleSize = CalcBrandTextSize(titleFont, titleFontSize, title);
+    ImGui::Dummy(ImVec2(titleSize.x + 8.0f, titleSize.y + 1.0f));
     if (g_FontSmall != nullptr)
     {
         ImGui::PushFont(g_FontSmall);
@@ -1485,18 +2366,31 @@ void RenderProfileAvatar()
     constexpr float diameter = 46.0f;
     const ImVec2 avatarSize(diameter, diameter);
     const ImVec2 pos = ImGui::GetCursorScreenPos();
+    const ImGuiID itemId = ImGui::GetID("##ProfileAvatar");
     const bool clicked = ImGui::InvisibleButton("##ProfileAvatar", avatarSize);
     const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+    {
+        SpawnRipple(itemId, pos, ImVec2(pos.x + diameter, pos.y + diameter), 0.84f);
+    }
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const ImVec2 center(pos.x + diameter * 0.5f, pos.y + diameter * 0.5f);
-    const float radius = diameter * 0.5f;
+    float hoverT = 0.0f;
+    float pressT = 0.0f;
+    UpdateInteractionAnimation(itemId, hovered, active, hoverT, pressT);
+    const float drawScale = 1.0f + hoverT * 0.035f - pressT * 0.055f;
+    const float drawDiameter = diameter * drawScale;
+    const ImVec2 drawPos(center.x - drawDiameter * 0.5f, center.y - drawDiameter * 0.5f);
+    const ImVec2 drawMax(drawPos.x + drawDiameter, drawPos.y + drawDiameter);
+    const float radius = drawDiameter * 0.5f;
 
     if (g_ProfileAvatarTexture != nullptr)
     {
         drawList->AddImageRounded(
             reinterpret_cast<ImTextureID>(g_ProfileAvatarTexture),
-            pos,
-            ImVec2(pos.x + diameter, pos.y + diameter),
+            drawPos,
+            drawMax,
             ImVec2(0.0f, 0.0f),
             ImVec2(1.0f, 1.0f),
             ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 1.0f)),
@@ -1511,6 +2405,12 @@ void RenderProfileAvatar()
             drawList->AddCircle(center, radius + 1.5f, AccentU32(0.46f), 48, 1.6f);
         }
     }
+    if (hoverT > 0.001f || pressT > 0.001f)
+    {
+        drawList->AddCircle(center, radius + 4.0f, AccentU32(0.20f * hoverT + 0.12f * pressT), 48, 2.0f);
+        drawList->AddCircleFilled(center, radius + 8.0f * hoverT, AccentU32(0.055f * hoverT), 48);
+    }
+    RenderRipplesForItem(drawList, itemId, drawPos, drawMax);
 
     if (clicked)
     {
@@ -1525,6 +2425,7 @@ void RenderProfileAvatar()
             {
                 if (LoadProfilePictureFromPath(path))
                 {
+                    RequestAutoConfigSave();
                     ShowToast("Profile picture updated", ToastType::Success);
                 }
                 else
@@ -1548,7 +2449,7 @@ void RenderSidebar(Category* selected)
     constexpr float headerHeight = 72.0f;
     constexpr float footerHeight = 82.0f;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, WithAlpha(kSidebarBg, 0.88f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, WithAlpha(kSidebarBg, 0.74f * PanelOpacity()));
     DrawSoftShadow(
         ImGui::GetWindowDrawList(),
         ImGui::GetCursorScreenPos(),
@@ -1582,7 +2483,27 @@ void RenderSidebar(Category* selected)
         ? sidebarRemainingHeight - footerHeight
         : 0.0f;
 
-    ImGui::BeginChild("SidebarCategories", ImVec2(0.0f, middleHeight), false);
+    ImGui::BeginChild("SidebarCategories", ImVec2(0.0f, middleHeight), false, ImGuiWindowFlags_NoScrollWithMouse);
+    static float sidebarScrollTarget = 0.0f;
+    const float currentSidebarScroll = ImGui::GetScrollY();
+    const float maxSidebarScroll = ImGui::GetScrollMaxY();
+    if (std::fabs(currentSidebarScroll - sidebarScrollTarget) < 0.5f)
+    {
+        sidebarScrollTarget = currentSidebarScroll;
+    }
+    if (ImGui::IsWindowHovered() && ImGui::GetIO().MouseWheel != 0.0f)
+    {
+        sidebarScrollTarget -= ImGui::GetIO().MouseWheel * 48.0f;
+        if (sidebarScrollTarget < 0.0f)
+        {
+            sidebarScrollTarget = 0.0f;
+        }
+        if (sidebarScrollTarget > maxSidebarScroll)
+        {
+            sidebarScrollTarget = maxSidebarScroll;
+        }
+    }
+    ImGui::SetScrollY(Approach(currentSidebarScroll, sidebarScrollTarget, kAnimMedium));
     DrawAnimatedTechPattern(
         ImGui::GetWindowDrawList(),
         ImGui::GetWindowPos(),
@@ -1606,8 +2527,8 @@ void RenderSidebar(Category* selected)
         {
             indicatorY = selectedRowMin.y;
         }
-        indicatorY = Approach(indicatorY, selectedRowMin.y, 0.15f);
-        indicatorHeight = Approach(indicatorHeight, selectedRowMax.y - selectedRowMin.y, 0.15f);
+        indicatorY = Approach(indicatorY, selectedRowMin.y, kAnimMedium);
+        indicatorHeight = Approach(indicatorHeight, selectedRowMax.y - selectedRowMin.y, kAnimMedium);
         ImGui::GetWindowDrawList()->AddRectFilled(
             ImVec2(selectedRowMin.x, indicatorY),
             ImVec2(selectedRowMin.x + 4.0f, indicatorY + indicatorHeight),
@@ -1644,7 +2565,15 @@ void RenderSidebar(Category* selected)
     ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
     ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
     ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputText("##ProfileName", g_ProfileName, sizeof(g_ProfileName));
+    const bool profileNameCommitted = ImGui::InputText(
+        "##ProfileName",
+        g_ProfileName,
+        sizeof(g_ProfileName),
+        ImGuiInputTextFlags_EnterReturnsTrue);
+    if (profileNameCommitted || ImGui::IsItemDeactivatedAfterEdit())
+    {
+        RequestAutoConfigSave();
+    }
     if (ImGui::IsItemActive())
     {
         ImGui::GetWindowDrawList()->AddRect(
@@ -1679,7 +2608,7 @@ void RenderLiveStatsBar()
         pingTarget = 18.0f + static_cast<float>((pingSeed >> 16) % 18u);
         nextPingUpdate = now + 1.15 + static_cast<double>((pingSeed >> 8) % 70u) / 100.0;
     }
-    pingValue = Approach(pingValue, pingTarget, 0.75f);
+    pingValue = Approach(pingValue, pingTarget, kAnimSlow);
 
     const int elapsed = static_cast<int>(now - launchTime);
     const int hours = elapsed / 3600;
@@ -1747,106 +2676,44 @@ void RenderLiveStatsBar()
     ImGui::Dummy(ImVec2(width, barHeight + 8.0f));
 }
 
-void PopupButton(const char* label, const char* popupId, const char* popupText, const char* toastMessage, ToastType toastType)
-{
-    if (GradientButton(label, ImVec2(118.0f, 28.0f)))
-    {
-        ShowToast(toastMessage, toastType);
-        ImGui::OpenPopup(popupId);
-    }
-    Tooltip("Opens a mock configuration dialog. No file I/O is performed.");
-
-    if (ImGui::BeginPopupModal(popupId, nullptr, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-        ImGui::TextUnformatted(popupText);
-        if (ImGui::Button("OK", ImVec2(96.0f, 0.0f)))
-        {
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-}
-
-void SaveConfigButton()
-{
-    if (GradientButton("Save Config", ImVec2(118.0f, 28.0f)))
-    {
-        const ConfigSaveResult result = SaveConfigToFile(g_ProfileName);
-        if (result.success)
-        {
-            const std::string message = "Configuration saved to " + result.path;
-            ShowToast(message.c_str(), ToastType::Success);
-        }
-        else
-        {
-            const std::string message = "Save failed: " + result.error;
-            ShowToast(message.c_str(), ToastType::Warning);
-        }
-    }
-    Tooltip("Writes the current UI state to a JSON config next to the executable.");
-}
-
-void LoadConfigButton()
-{
-    if (GradientButton("Load Config", ImVec2(118.0f, 28.0f)))
-    {
-        const ConfigSaveResult result = LoadConfigFromFile(g_ProfileName);
-        if (result.success)
-        {
-            const std::string message = "Configuration loaded from " + result.path;
-            ShowToast(message.c_str(), ToastType::Info);
-            if (!result.warning.empty())
-            {
-                ShowToast(result.warning.c_str(), ToastType::Warning);
-            }
-        }
-        else
-        {
-            const std::string message = "Load failed: " + result.error;
-            ShowToast(message.c_str(), ToastType::Warning);
-        }
-    }
-    Tooltip("Loads the current profile JSON from the configs folder.");
-}
-
-void DeleteConfigButton()
-{
-    if (GradientButton("Delete Config", ImVec2(118.0f, 28.0f)))
-    {
-        const ConfigSaveResult result = DeleteConfigFile(g_ProfileName);
-        if (result.success)
-        {
-            ShowToast("Configuration file deleted", ToastType::Warning);
-        }
-        else
-        {
-            const char* message = result.error == "Config file does not exist"
-                ? "No configuration file found to delete"
-                : result.error.c_str();
-            ShowToast(message, ToastType::Warning);
-        }
-    }
-    Tooltip("Deletes the current profile JSON from the configs folder.");
-}
-
 void AccentSwatch(const char* label, ImVec4 color)
 {
     ImGui::PushID(label);
     const ImVec2 pos = ImGui::GetCursorScreenPos();
     const ImVec2 size(18.0f, 18.0f);
+    const ImGuiID itemId = ImGui::GetID("##swatch");
     const bool pressed = ImGui::InvisibleButton("##swatch", size);
     const bool hovered = ImGui::IsItemHovered();
+    const bool active = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked(ImGuiMouseButton_Left))
+    {
+        SpawnRipple(itemId, pos, ImVec2(pos.x + size.x, pos.y + size.y), 0.90f);
+    }
     ImDrawList* drawList = ImGui::GetWindowDrawList();
     const ImVec2 center(pos.x + size.x * 0.5f, pos.y + size.y * 0.5f);
+    float hoverT = 0.0f;
+    float pressT = 0.0f;
+    UpdateInteractionAnimation(itemId, hovered, active, hoverT, pressT);
+    float* popStart = ImGui::GetStateStorage()->GetFloatRef(itemId ^ 0x6A91C5u, -10.0f);
 
-    drawList->AddCircleFilled(center, 7.0f, ImGui::GetColorU32(color), 24);
-    drawList->AddCircle(center, hovered ? 8.5f : 8.0f, ImGui::GetColorU32(hovered ? ImVec4(0.950f, 0.950f, 0.980f, 1.0f) : kSectionBorder), 24, hovered ? 1.6f : 1.0f);
+    const float popAge = static_cast<float>(ImGui::GetTime() - static_cast<double>(*popStart));
+    const float popT = popAge >= 0.0f && popAge < kAnimStandard
+        ? sinf(EaseInOutCubic(popAge / kAnimStandard) * 3.14159265f)
+        : 0.0f;
+    const float scale = 1.0f + hoverT * 0.10f - pressT * 0.08f + popT * 0.20f;
+    const float fillRadius = 7.0f * scale;
+    const float ringRadius = 8.0f * scale;
+
+    drawList->AddCircleFilled(center, fillRadius + 5.0f * hoverT, ImGui::GetColorU32(WithAlpha(color, 0.11f * hoverT + 0.16f * popT)), 32);
+    drawList->AddCircleFilled(center, fillRadius, ImGui::GetColorU32(color), 24);
+    drawList->AddCircle(center, ringRadius, ImGui::GetColorU32(hoverT > 0.01f ? ImVec4(0.950f, 0.950f, 0.980f, 1.0f) : kSectionBorder), 24, 1.0f + hoverT * 0.8f);
+    RenderRipplesForItem(drawList, itemId, pos, ImVec2(pos.x + size.x, pos.y + size.y));
 
     if (pressed)
     {
-        g_AccentColor = color;
-        ApplyAccentThemeColors();
-        ShowToast("Theme updated", ToastType::Info);
+        *popStart = static_cast<float>(ImGui::GetTime());
+        StartAccentTransition(color);
+        RequestAutoConfigSave();
     }
     Tooltip(label);
     ImGui::PopID();
@@ -1857,8 +2724,10 @@ void RenderAppearanceControls()
     SectionBegin("Appearance");
     if (ImGui::ColorEdit4("Theme Color", reinterpret_cast<float*>(&g_AccentColor), ImGuiColorEditFlags_NoAlpha))
     {
+        g_AccentTransitionActive = false;
         g_AccentColor.w = 1.0f;
         ApplyAccentThemeColors();
+        RequestAutoConfigSave();
     }
     Tooltip("Changes the live accent color used throughout this UI session.");
 
@@ -1889,49 +2758,63 @@ void RenderBootSplash(float progress, float alpha)
     RenderBootSplashInternal(progress, alpha);
 }
 
-std::string FormatElapsedSince(std::int64_t timestamp)
+void DrawWelcomeReadySentence(ImDrawList* drawList, ImVec2 slotMin, ImVec2 slotMax, float alpha)
 {
-    if (timestamp <= 0)
+    static double firstVisibleTime = -1.0;
+    if (firstVisibleTime < 0.0)
     {
-        return "First launch";
+        firstVisibleTime = ImGui::GetTime();
     }
 
-    const std::int64_t now = static_cast<std::int64_t>(std::time(nullptr));
-    std::int64_t elapsed = now > timestamp ? now - timestamp : 0;
-    if (elapsed < 60)
-    {
-        return "Just now";
-    }
-    if (elapsed < 3600)
-    {
-        const std::int64_t minutes = elapsed / 60;
-        return std::to_string(minutes) + (minutes == 1 ? " minute ago" : " minutes ago");
-    }
-    if (elapsed < 86400)
-    {
-        const std::int64_t hours = elapsed / 3600;
-        return std::to_string(hours) + (hours == 1 ? " hour ago" : " hours ago");
-    }
+    const char* sentence = "Everything's configured. Time to play.";
+    ImFont* font = g_FontSection != nullptr ? g_FontSection : ImGui::GetFont();
+    const float fontSize = (g_FontSection != nullptr ? g_FontSection->LegacySize : ImGui::GetFontSize()) + 1.0f;
+    const ImVec2 textSize = font->CalcTextSizeA(fontSize, FLT_MAX, 0.0f, sentence);
+    const float revealT = EaseOutCubic(static_cast<float>((ImGui::GetTime() - firstVisibleTime) / 0.40));
+    const float textAlpha = Clamp01(alpha * revealT);
+    const float slideY = (1.0f - revealT) * 10.0f;
+    const ImVec2 textPos(
+        slotMin.x + ((slotMax.x - slotMin.x) - textSize.x) * 0.5f,
+        slotMin.y + ((slotMax.y - slotMin.y) - textSize.y) * 0.5f + slideY);
 
-    const std::int64_t days = elapsed / 86400;
-    return std::to_string(days) + (days == 1 ? " day ago" : " days ago");
-}
+    drawList->AddText(
+        font,
+        fontSize,
+        ImVec2(textPos.x + 1.0f, textPos.y + 1.0f),
+        ImGui::GetColorU32(ImVec4(0.0f, 0.0f, 0.0f, 0.22f * textAlpha)),
+        sentence);
+    drawList->AddText(
+        font,
+        fontSize,
+        textPos,
+        ImGui::GetColorU32(WithAlpha(g_AccentColor, textAlpha)),
+        sentence);
 
-void DrawWelcomeInfoRow(ImDrawList* drawList, ImVec2 pos, const char* label, const char* value, bool drawSwatch)
-{
-    const ImU32 labelColor = ImGui::GetColorU32(kMutedText);
-    const ImU32 valueColor = ImGui::GetColorU32(ImVec4(0.900f, 0.895f, 0.940f, 1.0f));
-    drawList->AddText(pos, labelColor, label);
-    if (drawSwatch)
+    const float sweepCycle = 3.6f;
+    const float sweepRaw = static_cast<float>(std::fmod(ImGui::GetTime() - firstVisibleTime, static_cast<double>(sweepCycle)) / sweepCycle);
+    const float shimmerWidth = textSize.x * 0.24f;
+    const float sweepX = textPos.x - textSize.x * 0.35f + (textSize.x * 1.70f * sweepRaw);
+    const float sweepFade = std::sin(Clamp01(sweepRaw) * 3.14159265f);
+    if (textAlpha > 0.001f && sweepFade > 0.001f)
     {
-        const ImVec2 swatchCenter(pos.x + 126.0f, pos.y + ImGui::GetTextLineHeight() * 0.5f);
-        drawList->AddCircleFilled(swatchCenter, 5.0f, ImGui::GetColorU32(g_AccentColor), 20);
-        drawList->AddCircle(swatchCenter, 6.0f, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.24f)), 20, 1.0f);
-        drawList->AddText(ImVec2(pos.x + 140.0f, pos.y), valueColor, value);
-    }
-    else
-    {
-        drawList->AddText(ImVec2(pos.x + 126.0f, pos.y), valueColor, value);
+        drawList->PushClipRect(
+            ImVec2(sweepX - shimmerWidth * 0.5f, textPos.y - 2.0f),
+            ImVec2(sweepX + shimmerWidth * 0.5f, textPos.y + textSize.y + 3.0f),
+            true);
+        drawList->AddText(
+            font,
+            fontSize,
+            textPos,
+            ImGui::GetColorU32(ImVec4(1.0f, 0.98f, 0.86f, 0.30f * textAlpha * sweepFade)),
+            sentence);
+        drawList->PopClipRect();
+        drawList->AddRectFilledMultiColor(
+            ImVec2(sweepX - shimmerWidth * 0.5f, textPos.y - 1.0f),
+            ImVec2(sweepX + shimmerWidth * 0.5f, textPos.y + textSize.y + 2.0f),
+            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)),
+            ImGui::GetColorU32(ImVec4(1.0f, 0.98f, 0.86f, 0.055f * textAlpha * sweepFade)),
+            ImGui::GetColorU32(ImVec4(1.0f, 0.98f, 0.86f, 0.055f * textAlpha * sweepFade)),
+            ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.000f)));
     }
 }
 
@@ -1972,26 +2855,14 @@ bool RenderWelcomeScreen(float alpha)
     const ImVec2 cardSize(authSize.x - 48.0f, 106.0f);
     const ImVec2 cardMin(centerX - cardSize.x * 0.5f, authPos.y + 178.0f);
     const ImVec2 cardMax(cardMin.x + cardSize.x, cardMin.y + cardSize.y);
-    DrawSectionCardShadow(drawList, cardMin, cardMax, kSectionRounding);
-    drawList->AddRectFilled(cardMin, cardMax, ImGui::GetColorU32(ImVec4(0.070f, 0.068f, 0.084f, 0.91f)), kSectionRounding);
-    drawList->AddRect(cardMin, cardMax, ImGui::GetColorU32(ImVec4(1.0f, 1.0f, 1.0f, 0.11f)), kSectionRounding, 0, 1.0f);
-    drawList->AddRect(ImVec2(cardMin.x + 2.0f, cardMin.y + 2.0f), ImVec2(cardMax.x - 2.0f, cardMax.y - 2.0f), AccentU32(0.08f), kSectionRounding - 1.0f, 0, 1.0f);
-
-    const std::string lastSession = FormatElapsedSince(GetLastSessionTimestamp(g_ProfileName));
-    const int savedConfigs = CountSavedConfigFiles();
-    char savedConfigText[32] = {};
-    std::snprintf(savedConfigText, sizeof(savedConfigText), "%d", savedConfigs);
-
-    DrawWelcomeInfoRow(drawList, ImVec2(cardMin.x + 20.0f, cardMin.y + 18.0f), "Last session:", lastSession.c_str(), false);
-    DrawWelcomeInfoRow(drawList, ImVec2(cardMin.x + 20.0f, cardMin.y + 45.0f), "Saved configs:", savedConfigText, false);
-    DrawWelcomeInfoRow(drawList, ImVec2(cardMin.x + 20.0f, cardMin.y + 72.0f), "Current theme:", "Accent", true);
+    DrawWelcomeReadySentence(drawList, cardMin, cardMax, alpha);
 
     const ImVec2 buttonSize(190.0f, 36.0f);
     ImGui::SetCursorScreenPos(ImVec2(centerX - buttonSize.x * 0.5f, authPos.y + 324.0f));
-    const bool clicked = GradientButton("Continue to Panel", buttonSize);
+    const bool clicked = ContinueToPanelButton(buttonSize);
     if (clicked)
     {
-        const ConfigSaveResult result = UpdateLastSessionTimestamp(g_ProfileName, static_cast<std::int64_t>(std::time(nullptr)));
+        const ConfigSaveResult result = UpdateLastSessionTimestamp(kAutoConfigProfileName, static_cast<std::int64_t>(std::time(nullptr)));
         if (!result.success)
         {
             ShowToast("Failed to update session timestamp", ToastType::Warning);
@@ -2219,17 +3090,88 @@ void ConfigTab()
 {
     RenderAppearanceControls();
     RenderHotkeyControls();
+}
 
-    SectionBegin("Profiles");
-    SaveConfigButton();
-    ImGui::SameLine();
-    LoadConfigButton();
-    ImGui::SameLine();
-    DeleteConfigButton();
-    PopupButton("Import", "Import Config Popup", "Config import preview only. No file I/O was performed.", "Settings imported", ToastType::Success);
-    ImGui::SameLine();
-    PopupButton("Export", "Export Config Popup", "Config export preview only. No file I/O was performed.", "Settings exported", ToastType::Success);
+void ResetAllSettingsToDefaults()
+{
+    g_ConfigState = UiConfigState{};
+    g_ToggleHotkey = VK_F2;
+    g_AccentTransitionActive = false;
+    g_AccentColor = ImVec4(0.486f, 0.227f, 0.929f, 1.0f);
+    ApplyAccentThemeColors();
+    g_Ripples.clear();
+    RequestAutoConfigSave();
+}
+
+void SettingsTab()
+{
+    PanelConfig& state = g_ConfigState.panel;
+
+    SectionBegin("Interface");
+    AutoSaveSliderFloatRow("Animation Speed", &state.animationSpeed, 0.5f, 2.0f, "%.1fx", "Controls global panel transition and feedback animation speed.");
+
+    float opacityPercent = state.panelOpacity * 100.0f;
+    ImGui::PushID("Panel Opacity");
+    BeginRightAlignedWidgetRow("Panel Opacity", kRowWidgetWidth);
+    PushRowWidgetStyle();
+    const bool opacityChanged = ImGui::SliderFloat("##slider", &opacityPercent, 60.0f, 100.0f, "%.0f%%", ImGuiSliderFlags_NoRoundToFormat);
+    PopRowWidgetStyle();
+    if (opacityChanged)
+    {
+        state.panelOpacity = opacityPercent / 100.0f;
+        RequestAutoConfigSave();
+    }
+    Tooltip("Controls the glass panel background opacity.");
+    ImGui::PopID();
+
+    AutoSaveToggleRow("Reduce Motion", &state.reduceMotion, "Disables animated background layers and click ripple effects.");
     SectionEnd();
+
+    SectionBegin("Behavior");
+    AutoSaveToggleRow("Start Minimized", &state.startMinimized, "Stores the launch preference for future wiring.");
+    AutoSaveToggleRow("Auto-Hide on Focus Loss", &state.autoHideOnFocusLoss, "Hides the panel when the overlay loses focus.");
+    SectionEnd();
+
+    static double resetConfirmStart = -10.0;
+    const double now = ImGui::GetTime();
+    const bool confirmActive = now - resetConfirmStart <= 3.0;
+    const ImVec4 themeAccent = g_AccentColor;
+    const ImVec4 warningAccent(0.940f, 0.180f, 0.220f, 1.0f);
+    bool resetApplied = false;
+
+    g_AccentColor = warningAccent;
+    SectionBegin("Danger Zone");
+    const char* resetLabel = confirmActive ? "Confirm Reset" : "Reset All Settings";
+    if (GradientButton(resetLabel, ImVec2(166.0f, 30.0f)))
+    {
+        if (confirmActive)
+        {
+            ResetAllSettingsToDefaults();
+            resetConfirmStart = -10.0;
+            resetApplied = true;
+            ShowToast("Settings reset to defaults", ToastType::Warning);
+        }
+        else
+        {
+            resetConfirmStart = now;
+        }
+    }
+    Tooltip("Resets theme, hotkey, panel settings, and all category controls to defaults.");
+    ImGui::SameLine();
+    if (confirmActive)
+    {
+        ImGui::TextColored(ImVec4(0.980f, 0.580f, 0.600f, 1.0f), "Are you sure? Click again to confirm");
+    }
+    else
+    {
+        ImGui::TextColored(kMutedText, "Restores default UI settings");
+    }
+    SectionEnd();
+
+    if (!resetApplied)
+    {
+        g_AccentColor = themeAccent;
+    }
 }
 
 void RenderSkinsTab()
@@ -2318,14 +3260,38 @@ void RenderCategoryContent(Category selected)
     case Category::Config:
         ConfigTab();
         break;
+    case Category::Settings:
+        SettingsTab();
+        break;
     default:
         break;
     }
 }
 
+void RenderCategoryLayer(Category category, ImVec2 baseCursor, float offsetX, float alpha, bool disabled)
+{
+    ImGui::SetCursorPos(ImVec2(baseCursor.x + offsetX, baseCursor.y));
+    ImGui::PushID(static_cast<int>(category));
+    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * alpha);
+    if (disabled)
+    {
+        ImGui::BeginDisabled(true);
+    }
+    RenderCategoryContent(category);
+    if (disabled)
+    {
+        ImGui::EndDisabled();
+    }
+    ImGui::PopStyleVar();
+    ImGui::PopID();
+}
+
 void RenderMainPanelTabs()
 {
     ApplyAccentThemeColors();
+    UpdateAccentTransition();
+    ApplyAccentThemeColors();
+    PruneInteractionEffects();
 
     static Category selected = Category::Aimbot;
     static Category previousSelected = Category::Aimbot;
@@ -2351,6 +3317,11 @@ void RenderMainPanelTabs()
         ImGui::GetWindowDrawList(),
         panelPos,
         ImVec2(panelPos.x + panelSize.x, panelPos.y + panelSize.y));
+    DrawAnimatedBorderTrace(
+        ImGui::GetWindowDrawList(),
+        panelPos,
+        ImVec2(panelPos.x + panelSize.x, panelPos.y + panelSize.y),
+        kOuterWindowRounding);
 
     ImGui::SetCursorScreenPos(bodyPos);
     const Category selectedBeforeSidebar = selected;
@@ -2370,7 +3341,7 @@ void RenderMainPanelTabs()
         contentPos,
         ImVec2(contentPos.x + contentSize.x, contentPos.y + contentSize.y),
         kSectionRounding);
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.055f, 0.064f, 0.86f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.055f, 0.055f, 0.064f, 0.70f * PanelOpacity()));
     ImGui::BeginChild("Content", ImVec2(0.0f, 0.0f), true);
     DrawContentBackgroundDepth(
         ImGui::GetWindowDrawList(),
@@ -2410,7 +3381,7 @@ void RenderMainPanelTabs()
 
     const double now = ImGui::GetTime();
     const float transitionProgress = categorySwitchStart >= 0.0
-        ? Clamp01(static_cast<float>((now - categorySwitchStart) / 0.15))
+        ? Clamp01(static_cast<float>((now - categorySwitchStart) / PanelAnimationDuration(kAnimMedium)))
         : 1.0f;
     if (transitionProgress >= 1.0f)
     {
@@ -2419,30 +3390,18 @@ void RenderMainPanelTabs()
     }
 
     const bool transitionActive = transitionProgress < 1.0f;
-    const bool showPrevious = transitionActive && transitionProgress < 0.5f;
-    const float halfProgress = showPrevious
-        ? EaseOutCubic(transitionProgress * 2.0f)
-        : EaseOutCubic((transitionProgress - 0.5f) * 2.0f);
-    const float contentAlpha = transitionActive
-        ? (showPrevious ? 1.0f - halfProgress : halfProgress)
-        : 1.0f;
-    const float slideOffset = transitionActive
-        ? (showPrevious ? -14.0f * halfProgress : 14.0f * (1.0f - halfProgress))
-        : 0.0f;
-    const Category contentCategory = showPrevious ? previousSelected : selected;
     const ImVec2 contentCursor = ImGui::GetCursorPos();
-    ImGui::SetCursorPosX(contentCursor.x + slideOffset);
-    ImGui::PushStyleVar(ImGuiStyleVar_Alpha, ImGui::GetStyle().Alpha * contentAlpha);
     if (transitionActive)
     {
-        ImGui::BeginDisabled(true);
+        const float eased = EaseInOutCubic(transitionProgress);
+        RenderCategoryLayer(previousSelected, contentCursor, -18.0f * eased, 1.0f - eased, true);
+        ImGui::SetCursorPos(contentCursor);
+        RenderCategoryLayer(selected, contentCursor, 18.0f * (1.0f - eased), eased, true);
     }
-    RenderCategoryContent(contentCategory);
-    if (transitionActive)
+    else
     {
-        ImGui::EndDisabled();
+        RenderCategoryLayer(selected, contentCursor, 0.0f, 1.0f, false);
     }
-    ImGui::PopStyleVar();
 
     ImGui::EndChild();
     ImGui::PopStyleColor();
